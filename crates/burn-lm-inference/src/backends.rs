@@ -6,7 +6,7 @@ mod elems {
             pub type ElemType = burn::tensor::f16;
             pub const DTYPE_NAME: &str = "f16";
         }
-        else if #[cfg(all(feature = "f16", any(feature = "cuda", feature = "wgpu", feature = "vulkan", feature = "metal", feature = "rocm", feature = "libtorch")))]{
+        else if #[cfg(all(feature = "bf16", any(feature = "cuda", feature = "wgpu", feature = "vulkan", feature = "metal", feature = "rocm", feature = "libtorch")))]{
             pub type ElemType = burn::tensor::bf16;
             pub const DTYPE_NAME: &str = "bf16";
         } else {
