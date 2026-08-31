@@ -1,6 +1,6 @@
 use super::super::*;
 use crate::{
-    batching::{BatchCapacity, BatchedDecoder, DecodeRow, KvBudget},
+    batching::{BatchCapacity, BatchedDecoder, DecodeRow, KvAdmission, KvBudget},
     errors::InferenceError,
     job::{CancelSignal, GenerationParams, InferenceJob, InferenceTask},
     sampler::{Argmax, Sampler},
@@ -181,6 +181,8 @@ pub(super) struct FakeServer {
     /// admission gate never binds; a test lowers it via [`with_kv_budget`](Self::with_kv_budget) to
     /// prove admission waits on blocks.
     pub(super) kv: KvBudget,
+    /// The admission policy `kv_admission` reports; elastic by default like the real trait.
+    pub(super) admission: KvAdmission,
 }
 
 impl Default for FakeServer {
@@ -199,6 +201,7 @@ impl FakeServer {
             fixed_token: None,
             prompt_tokens: 1,
             kv: KvBudget::unlimited(),
+            admission: KvAdmission::Elastic,
         }
     }
 
@@ -208,6 +211,13 @@ impl FakeServer {
         let mut server = Self::new(slots, log);
         server.decoder.extra_rows = 1;
         server
+    }
+
+    /// A server whose decoder never stops on its own, so the engine's `max_gen` cap (or the
+    /// request's `max_tokens`) is what ends every sequence — for tests that assert exact budgets.
+    pub(super) fn with_unbounded_emit(mut self) -> Self {
+        self.decoder.emit = 1000;
+        self
     }
 
     /// A server whose decoder emits many tokens, each after a small sleep — a long-running job
@@ -260,6 +270,12 @@ impl FakeServer {
     }
 
     /// A server reporting a finite KV block budget, so the admission gate's block half can bind.
+    /// A server running the strict `Reserve` admission policy.
+    pub(super) fn with_reserve_admission(mut self) -> Self {
+        self.admission = KvAdmission::Reserve;
+        self
+    }
+
     pub(super) fn with_kv_budget(mut self, block_size: usize, total_blocks: usize) -> Self {
         self.kv = KvBudget {
             block_size,
@@ -312,6 +328,10 @@ impl BatchedInferenceServer for FakeServer {
             max_slots: self.slots,
             kv: self.kv,
         }
+    }
+
+    fn kv_admission(&self) -> KvAdmission {
+        self.admission
     }
 
     fn tokenize(&self, task: &InferenceTask) -> InferenceResult<Vec<u32>> {

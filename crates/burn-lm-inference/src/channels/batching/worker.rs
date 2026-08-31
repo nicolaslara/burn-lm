@@ -58,6 +58,19 @@ pub const FINISH_REASON_STAT_NAME: &str = "Finish Reason";
 /// serving payload above.
 type JobSeq = ActiveSeq<JobMeta>;
 
+/// A sequence evicted mid-flight to unblock the pool, waiting to resume. Its delivery state
+/// (emitter, cursor, completion) still lives on the emission thread under `meta.id`, so when it is
+/// re-admitted the stream simply continues — the client never learns it was interrupted. `tokens`
+/// holds prompt plus everything generated so far; re-admission re-prefills the whole buffer (KV
+/// recompute) and decoding picks up where it stopped, with `generated` preserved so the cap and
+/// the stats stay correct.
+struct ResumedJob {
+    tokens: Vec<u32>,
+    max_gen: usize,
+    generated: usize,
+    meta: JobMeta,
+}
+
 /// What one turn of the worker loop decided to do next: keep going, or shut the thread down.
 enum Flow {
     Continue,
@@ -81,6 +94,9 @@ pub(super) fn spawn<S: BatchedInferenceServer + 'static>(seed: S) -> InferenceRe
             let mut server = seed;
             let mut queue: VecDeque<QueuedJob> = VecDeque::new();
             let mut active: Vec<JobSeq> = Vec::new();
+            // Sequences evicted to unblock the pool, waiting for a slot and blocks to resume.
+            // Drained ahead of the queue at admission: they already waited once.
+            let mut resume: Vec<ResumedJob> = Vec::new();
             // The delivery side of this worker (see `emission.rs`): owned by this thread so a
             // fresh worker always gets a fresh emission thread, and dropping our sender on ANY
             // exit path — shutdown or panic — is what tells it to fail whatever is still live.
@@ -98,7 +114,7 @@ pub(super) fn spawn<S: BatchedInferenceServer + 'static>(seed: S) -> InferenceRe
                 // because nothing crossing the boundary is reused: the server is dropped on exit, and
                 // `queue`/`active` are only read to send `WorkerDied` replies, then cleared.
                 let flow = catch_unwind(AssertUnwindSafe(|| {
-                    worker_iteration(&mut server, &mut queue, &mut active, &receiver, &emission, &mut next_id)
+                    worker_iteration(&mut server, &mut queue, &mut active, &mut resume, &receiver, &emission, &mut next_id)
                 }));
                 match flow {
                     Ok(Flow::Continue) => {}
@@ -138,6 +154,7 @@ fn worker_iteration<S: BatchedInferenceServer>(
     server: &mut S,
     queue: &mut VecDeque<QueuedJob>,
     active: &mut Vec<JobSeq>,
+    resume: &mut Vec<ResumedJob>,
     receiver: &std::sync::mpsc::Receiver<Command>,
     emission: &std::sync::mpsc::Sender<emission::EmissionEvent>,
     next_id: &mut u64,
@@ -145,8 +162,11 @@ fn worker_iteration<S: BatchedInferenceServer>(
     // Only block for a command when there's genuinely nothing to do: nothing active, and nothing
     // admittable (a queued job with a free slot). We only wake from `recv` when a new command
     // arrives — but an admittable job is already in `queue`, with no further command coming to wake
-    // us — so blocking now would sleep forever on work we could have run.
-    let can_admit = !queue.is_empty() && server.batch_capacity().max_slots > active.len();
+    // us — so blocking now would sleep forever on work we could have run. Evicted sequences on
+    // `resume` count as admittable for the same reason: their callers are waiting mid-stream and
+    // no command will ever arrive on their behalf.
+    let can_admit =
+        (!queue.is_empty() || !resume.is_empty()) && server.batch_capacity().max_slots > active.len();
     if active.is_empty() && !can_admit {
         match receiver.recv() {
             Ok(command) => {
@@ -168,11 +188,11 @@ fn worker_iteration<S: BatchedInferenceServer>(
 
     // Admit queued jobs while there is room for them. Anything that doesn't fit stays at the front
     // of the queue for a later turn — this is where backpressure happens.
-    admit(server, queue, active, emission, next_id);
+    admit(server, queue, active, resume, emission, next_id);
 
     // Advance every decoding sequence by one token (plus at most one prefill), then retire whatever
     // just finished. Each retire frees a slot, so the next turn can admit more.
-    step(server, active, emission);
+    step(server, active, resume, emission);
 
     Flow::Continue
 }
@@ -269,9 +289,58 @@ fn admit<S: BatchedInferenceServer>(
     server: &mut S,
     queue: &mut VecDeque<QueuedJob>,
     active: &mut Vec<JobSeq>,
+    resume: &mut Vec<ResumedJob>,
     emission: &std::sync::mpsc::Sender<emission::EmissionEvent>,
     next_id: &mut u64,
 ) {
+    // Evicted sequences resume ahead of the queue: they already waited their turn once, and their
+    // callers are mid-stream. Same gate as a fresh job — a slot plus the guarantee for their
+    // current footprint — but no queue permit (they left the queue long ago) and no `Admitted`
+    // event (their delivery state never left the emission thread).
+    while !resume.is_empty() && active.len() < server.batch_capacity().max_slots {
+        let max_context_len = match server.decoder() {
+            Ok(decoder) => decoder.max_context_len(),
+            Err(_) => break,
+        };
+        let kv = server.batch_capacity().kv;
+        let candidate = resume.last().expect("checked non-empty");
+        let guaranteed = if active.is_empty() || server.kv_admission() == crate::batching::KvAdmission::Reserve {
+            let worst = candidate.tokens.len() + candidate.max_gen - candidate.generated;
+            kv.blocks_for(worst.min(max_context_len))
+        } else {
+            kv.blocks_for((candidate.tokens.len() + 1).min(max_context_len))
+        };
+        let reserved: usize = active.iter().map(|seq| seq.kv_reservation).sum();
+        if guaranteed > kv.total_blocks.saturating_sub(reserved) {
+            break;
+        }
+        let job = resume.pop().expect("checked non-empty");
+        let slot = (0..server.batch_capacity().max_slots)
+            .find(|candidate| active.iter().all(|seq| seq.slot != *candidate))
+            .expect("admission only runs while a slot is free");
+        if let Ok(decoder) = server.decoder() {
+            decoder.release(slot);
+        }
+        tracing::debug!(
+            target: "batching",
+            slot,
+            generated_so_far = job.generated,
+            kv_blocks_reserved = guaranteed,
+            "resumed an evicted sequence"
+        );
+        active.push(ActiveSeq {
+            slot,
+            tokens: job.tokens,
+            processed: 0,
+            generated: job.generated,
+            max_gen: job.max_gen,
+            finished: false,
+            kv_reservation: guaranteed,
+            paused: false,
+            extra: job.meta,
+        });
+    }
+
     while active.len() < server.batch_capacity().max_slots {
         // Decide whether the FRONT job fits before taking it off the queue, so a job that must
         // wait for KV blocks keeps both its place in line and its queue permit. Jobs that will
@@ -337,8 +406,18 @@ fn admit<S: BatchedInferenceServer>(
                 .send(Err(InferenceError::KvPoolExhausted(need - kv.total_blocks)));
             continue;
         }
+        // Elastic admission guarantees only the prompt footprint (plus one block of headroom to
+        // start decoding); growth is granted block-by-block each round, pausing when the pool is
+        // momentarily dry. The first sequence into an empty set always gets its full worst case —
+        // that is the invariant that keeps the pool live: the oldest sequence can always finish,
+        // and finishing frees blocks. `Reserve` mode guarantees the worst case for everyone.
+        let guaranteed = if active.is_empty() || server.kv_admission() == crate::batching::KvAdmission::Reserve {
+            need
+        } else {
+            kv.blocks_for((tokens.len() + 1).min(max_context_len))
+        };
         let reserved: usize = active.iter().map(|seq| seq.kv_reservation).sum();
-        if need > kv.total_blocks.saturating_sub(reserved) {
+        if guaranteed > kv.total_blocks.saturating_sub(reserved) {
             break;
         }
 
@@ -367,8 +446,8 @@ fn admit<S: BatchedInferenceServer>(
             target: "batching",
             slot,
             in_flight = active.len() + 1,
-            kv_blocks_reserved = need,
-            kv_blocks_outstanding = reserved + need,
+            kv_blocks_reserved = guaranteed,
+            kv_blocks_outstanding = reserved + guaranteed,
             kv_blocks_total = kv.total_blocks,
             "admitted a sequence to a decode lane"
         );
@@ -402,7 +481,8 @@ fn admit<S: BatchedInferenceServer>(
             generated: 0,
             max_gen,
             finished: false,
-            kv_reservation: need,
+            kv_reservation: guaranteed,
+            paused: false,
             extra: JobMeta {
                 id,
                 hit_stop: false,
@@ -411,6 +491,116 @@ fn admit<S: BatchedInferenceServer>(
                 cancelled: false,
             },
         });
+    }
+}
+
+/// One round's KV growth grants (see the comment at the call site in `step`). `release` frees an
+/// evicted sequence's decoder lane; the pool blocks come back with it.
+///
+/// Reservations only ever ratchet up here; the sum over `active` stays ≤ `total_blocks`, which is
+/// the same derived-total invariant `Reserve` admission relies on — elastic mode just reaches the
+/// total by many small grants instead of one big one.
+fn grant_kv_growth(
+    kv: &crate::batching::KvBudget,
+    ctx: usize,
+    active: &mut Vec<JobSeq>,
+    resume: &mut Vec<ResumedJob>,
+    mut release: impl FnMut(usize),
+) {
+    // An unlimited budget (no block accounting) can never bind: nothing to grant or pause.
+    if kv.total_blocks == usize::MAX {
+        return;
+    }
+    let mut reserved: usize = active.iter().map(|seq| seq.kv_reservation).sum();
+
+    // Top the oldest live sequence up toward its full worst case before anyone else grows. Its
+    // guaranteed completion is what keeps the pool live, so it has first claim on slack.
+    if let Some(senior) = active.iter_mut().find(|seq| !seq.finished) {
+        let worst = senior.tokens.len() + senior.max_gen.saturating_sub(senior.generated);
+        let full = kv.blocks_for(worst.min(ctx));
+        if full > senior.kv_reservation {
+            let take = (full - senior.kv_reservation).min(kv.total_blocks - reserved);
+            senior.kv_reservation += take;
+            reserved += take;
+        }
+    }
+
+    // Grant growth oldest-first. Only a decoding lane can outgrow its reservation (a prefilling
+    // lane's prompt is covered by its admission guarantee), and only when its next token starts a
+    // fresh block.
+    let senior_index = active.iter().position(|seq| !seq.finished);
+    let mut index = 0;
+    while index < active.len() {
+        let seq = &active[index];
+        if seq.finished {
+            index += 1;
+            continue;
+        }
+        let need = kv.blocks_for(seq.tokens.len().min(ctx));
+        if need <= seq.kv_reservation {
+            active[index].paused = false;
+            index += 1;
+            continue;
+        }
+        let delta = need - seq.kv_reservation;
+        if delta <= kv.total_blocks - reserved {
+            active[index].kv_reservation += delta;
+            reserved += delta;
+            active[index].paused = false;
+            index += 1;
+            continue;
+        }
+        if Some(index) == senior_index {
+            // The one sequence guaranteed to finish cannot grow: evict the youngest to free its
+            // blocks. Its stream resumes seamlessly after re-admission (see `ResumedJob`). This
+            // corner needs a promotion shortfall (the previous oldest retired while the pool was
+            // full), so it is rare; the alternative is a deadlock where everyone waits for blocks
+            // only a retirement can free.
+            // Victims are strictly younger than the senior (higher index): removing one never
+            // shifts the senior's position, and the oldest work is never thrown away.
+            match active
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(victim, seq)| *victim > index && !seq.finished)
+                .map(|(victim, _)| victim)
+            {
+                Some(victim) => {
+                    let seq = active.remove(victim);
+                    reserved -= seq.kv_reservation;
+                    release(seq.slot);
+                    tracing::info!(
+                        target: "batching",
+                        slot = seq.slot,
+                        generated_so_far = seq.generated,
+                        kv_blocks_freed = seq.kv_reservation,
+                        "evicted the youngest sequence to unblock the pool; it will resume"
+                    );
+                    resume.push(ResumedJob {
+                        tokens: seq.tokens,
+                        max_gen: seq.max_gen,
+                        generated: seq.generated,
+                        meta: seq.extra,
+                    });
+                    // Retry the senior with the freed blocks; don't advance `index`.
+                    continue;
+                }
+                None => {
+                    // Nobody to evict: the senior is alone yet uncovered, which admission's
+                    // full-reservation rule for a solo sequence makes unreachable. Pause rather
+                    // than panic; a retirement or config change is the only way forward.
+                    tracing::error!(
+                        target: "batching",
+                        "KV pool cannot cover the oldest sequence and nothing can be evicted"
+                    );
+                    active[index].paused = true;
+                    index += 1;
+                }
+            }
+        } else {
+            active[index].paused = true;
+            index += 1;
+        }
     }
 }
 
@@ -426,6 +616,7 @@ static CAP_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 fn step<S: BatchedInferenceServer>(
     server: &mut S,
     active: &mut Vec<JobSeq>,
+    resume: &mut Vec<ResumedJob>,
     emission: &std::sync::mpsc::Sender<emission::EmissionEvent>,
 ) {
     // Nothing active, so don't touch the model. This guard matters because `decoder()` loads
@@ -456,6 +647,25 @@ fn step<S: BatchedInferenceServer>(
     // Read the chunked-prefill width now, while we still hold only `&self` — the same reason the
     // sampler is taken owned above: it must not collide with the `&mut` decoder borrow below.
     let chunk_size = server.prefill_chunk_size();
+
+    // Before the round runs, settle who may grow. Under elastic admission a sequence's
+    // reservation covers its prompt but not its whole generation, so each round the worker grants
+    // growth block-by-block out of the pool's slack: a sequence whose next token stays inside its
+    // reservation always runs; one that needs a fresh block runs if the pool can cover it (its
+    // reservation ratchets up — granted blocks are never handed back until retirement); otherwise
+    // it pauses for the round and is retried next round, when a retirement may have freed blocks.
+    // The oldest sequence is special twice over: it is topped up toward its full worst case before
+    // anyone else grows, and if even then it cannot take the block it needs, the YOUNGEST sequence
+    // is evicted — its lane freed, its state parked on `resume` — because the oldest finishing is
+    // what guarantees the pool ever frees. Under `Reserve` admission reservations already cover
+    // every worst case, so this pass grants within reservations and never pauses or evicts.
+    {
+        let kv = server.batch_capacity().kv;
+        if let Ok(decoder) = server.decoder() {
+            let ctx = decoder.max_context_len();
+            grant_kv_growth(&kv, ctx, active, resume, |slot| decoder.release(slot));
+        }
+    }
 
     // Borrow the decoder for the whole round. If the model isn't loaded we can't run anything, so
     // rather than panic the worker we retire every active sequence with that error.

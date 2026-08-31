@@ -382,6 +382,20 @@ macro_rules! impl_batched_llama_server {
                 config_usize(self.config.prefill_chunk_size, "BURN_LM_PREFILL_CHUNK_SIZE")
             }
 
+            fn kv_admission(&self) -> burn_lm_inference::batching::KvAdmission {
+                // Elastic is the default (see the trait): capacity tracks what sequences actually
+                // use. `BURN_LM_KV_ADMISSION=reserve` restores the strict worst-case gate for
+                // deployments that want the no-pause guarantee.
+                if std::env::var("BURN_LM_KV_ADMISSION")
+                    .map(|v| v.eq_ignore_ascii_case("reserve"))
+                    .unwrap_or(false)
+                {
+                    burn_lm_inference::batching::KvAdmission::Reserve
+                } else {
+                    burn_lm_inference::batching::KvAdmission::Elastic
+                }
+            }
+
             fn tokenize(&self, task: &InferenceTask) -> InferenceResult<Vec<u32>> {
                 let prompt = match task {
                     InferenceTask::Message(message) => self.server.prompt(vec![message.clone()])?,

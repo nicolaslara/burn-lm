@@ -104,6 +104,7 @@ impl<T: Tokenizer + 'static> Llama<T> {
                     // the decoder's lane count up front, and the pool matches that rectangle, so
                     // block accounting is the serving worker's concern, not this one's.
                     kv_reservation: 0,
+                    paused: false,
                     extra: state,
                 }
             })

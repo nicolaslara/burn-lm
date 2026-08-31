@@ -44,7 +44,9 @@ fn capacity_two_admits_concurrently_and_interleaves() {
 #[test]
 fn kv_budget_serializes_admission_when_blocks_run_short() {
     let log: OrderLog = Arc::new(Mutex::new(Vec::new()));
-    let server = FakeServer::new(2, log.clone()).with_kv_budget(1, 20);
+    let server = FakeServer::new(2, log.clone())
+        .with_kv_budget(1, 20)
+        .with_reserve_admission();
     let out = submit_two_on(server, log);
     assert!(
         out.contains(&0) && out.contains(&1),
@@ -167,6 +169,7 @@ fn at_most_one_prompt_prefills_per_round_while_another_sequence_decodes() {
             max_gen: 8,
             finished: false,
             kv_reservation: 0,
+            paused: false,
             extra: (),
         }
     }
@@ -246,6 +249,7 @@ fn decoding_sequences_share_one_fused_decode_call() {
             max_gen: 8,
             finished: false,
             kv_reservation: 0,
+            paused: false,
             extra: (),
         }
     }
@@ -293,6 +297,7 @@ fn a_fused_decode_error_retires_every_decode_row_but_not_a_concurrent_prefill() 
             max_gen: 8,
             finished: false,
             kv_reservation: 0,
+            paused: false,
             extra: (),
         }
     }
@@ -305,6 +310,7 @@ fn a_fused_decode_error_retires_every_decode_row_but_not_a_concurrent_prefill() 
             max_gen: 8,
             finished: false,
             kv_reservation: 0,
+            paused: false,
             extra: (),
         }
     }
@@ -358,6 +364,7 @@ fn a_mixed_round_aligns_each_sampled_token_to_its_sequence() {
             max_gen: 8,
             finished: false,
             kv_reservation: 0,
+            paused: false,
             extra: (),
         }
     }
@@ -370,6 +377,7 @@ fn a_mixed_round_aligns_each_sampled_token_to_its_sequence() {
             max_gen: 8,
             finished: false,
             kv_reservation: 0,
+            paused: false,
             extra: (),
         }
     }
@@ -423,6 +431,7 @@ fn a_lane_over_the_context_limit_retires_alone_without_failing_its_batch_mates()
             max_gen: 100,
             finished: false,
             kv_reservation: 0,
+            paused: false,
             extra: (),
         }
     }
@@ -484,6 +493,7 @@ fn a_prompt_longer_than_the_context_window_is_rejected_before_prefill() {
         max_gen: 8,
         finished: false,
         kv_reservation: 0,
+        paused: false,
         extra: (),
     }];
 
@@ -588,6 +598,7 @@ fn chunked_prefill_defers_sampling_to_the_final_chunk() {
             max_gen,
             finished: false,
             kv_reservation: 0,
+            paused: false,
             extra: (),
         }
     }
@@ -651,6 +662,7 @@ fn a_failed_prefill_chunk_retires_the_sequence() {
             max_gen,
             finished: false,
             kv_reservation: 0,
+            paused: false,
             extra: (),
         }
     }
@@ -676,4 +688,105 @@ fn a_failed_prefill_chunk_retires_the_sequence() {
         active[0].generated, 0,
         "a prompt that failed before its final chunk produced no token"
     );
+}
+
+/// The elastic counterpart of `kv_budget_serializes_admission_when_blocks_run_short`: the same
+/// pool that Reserve admission must serialize (two worst cases of 17 against 20 blocks) runs both
+/// jobs together under the default elastic policy, because each is only charged its prompt
+/// footprint up front. The second job's growth may pause when the pool tightens, but both streams
+/// overlap — the width the block pool exists to buy.
+#[test]
+fn elastic_admission_interleaves_where_reserve_serializes() {
+    let log: OrderLog = Arc::new(Mutex::new(Vec::new()));
+    let server = FakeServer::new(2, log.clone()).with_kv_budget(1, 20);
+    let out = submit_two_on(server, log);
+    assert!(
+        out.contains(&0) && out.contains(&1),
+        "both sequences should produce output: {out:?}"
+    );
+    let last0 = out.iter().rposition(|&x| x == 0).unwrap();
+    let first1 = out.iter().position(|&x| x == 1).unwrap();
+    assert!(
+        first1 < last0,
+        "elastic admission should overlap the two jobs: {out:?}"
+    );
+}
+
+/// Elastic growth under pressure, end to end: a pool sized so the junior sequence must pause
+/// mid-generation (the senior holds its full worst case; the junior's block-by-block growth
+/// exhausts the slack), then resume after the senior retires and frees its blocks. Both requests
+/// must complete their full token budget — a pause is a delay, never a truncation — and reply
+/// exactly once.
+#[test]
+fn a_paused_sequence_resumes_and_completes_in_full() {
+    let log: OrderLog = Arc::new(Mutex::new(Vec::new()));
+    // Worst case per job: 1 prompt + 16 generated = 17 blocks. Pool of 20: the senior reserves 17,
+    // the junior is admitted on 2 and can grow by at most 1 before pausing.
+    let server = FakeServer::new(2, log.clone())
+        .with_kv_budget(1, 20)
+        .with_unbounded_emit();
+    let channel = BatchingChannel::<FakeServer>::with_server(server);
+
+    let (job_a, _ha) = InferenceJob::create(
+        InferenceTask::Prompt("a".into()),
+        GenerationParams::default(),
+        NullListener,
+    );
+    let (job_b, _hb) = InferenceJob::create(
+        InferenceTask::Prompt("b".into()),
+        GenerationParams::default(),
+        NullListener,
+    );
+    let rx_a = channel.submit(job_a).unwrap();
+    let rx_b = channel.submit(job_b).unwrap();
+    let stats_a = rx_a.recv().unwrap().unwrap();
+    let stats_b = rx_b.recv().unwrap().unwrap();
+    assert!(
+        stats_a.entries.contains(&crate::stats::StatEntry::TokensCount(16)),
+        "senior should generate its full budget"
+    );
+    assert!(
+        stats_b.entries.contains(&crate::stats::StatEntry::TokensCount(16)),
+        "paused junior should still generate its full budget"
+    );
+}
+
+/// The eviction corner: a small senior retires while grown juniors pack the pool, so the promoted
+/// senior's full worst case cannot be topped up — the youngest sequence is evicted (its lane
+/// freed, its state parked) and later resumed. Every request must still complete its exact token
+/// budget, and every stream must reply exactly once: eviction is invisible to callers except as
+/// time.
+#[test]
+fn eviction_under_promotion_shortfall_completes_everyone() {
+    let log: OrderLog = Arc::new(Mutex::new(Vec::new()));
+    // Pool of 12, block_size 1. A: worst 3 (cap 2). B/C/D: worst 11 each (cap 10) — each fits the
+    // pool alone, so none is rejected outright; together they force pauses, a promotion shortfall
+    // when A retires, and evictions as B tops up.
+    let server = FakeServer::new(4, log.clone())
+        .with_kv_budget(1, 12)
+        .with_unbounded_emit();
+    let channel = BatchingChannel::<FakeServer>::with_server(server);
+
+    let caps = [2usize, 10, 10, 10];
+    let mut rxs = Vec::new();
+    let mut handles = Vec::new();
+    for cap in caps {
+        let (job, handle) = InferenceJob::create(
+            InferenceTask::Prompt("x".into()),
+            GenerationParams {
+                max_tokens: Some(cap),
+                ..GenerationParams::default()
+            },
+            NullListener,
+        );
+        handles.push(handle);
+        rxs.push(channel.submit(job).unwrap());
+    }
+    for (rx, cap) in rxs.into_iter().zip(caps) {
+        let stats = rx.recv().unwrap().unwrap();
+        assert!(
+            stats.entries.contains(&crate::stats::StatEntry::TokensCount(cap)),
+            "every sequence must complete its exact budget (cap {cap})"
+        );
+    }
 }

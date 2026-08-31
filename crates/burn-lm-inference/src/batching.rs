@@ -40,6 +40,17 @@ pub struct BatchCapacity {
     pub kv: KvBudget,
 }
 
+/// How admission charges a sequence against the KV pool. `Reserve` takes the full worst case
+/// (`prompt + max_tokens`) up front: no sequence ever pauses, at the price of headroom that scales
+/// with how honest callers' caps are. `Elastic` guarantees the prompt footprint and grows
+/// block-by-block, pausing a sequence for a round when the pool is momentarily dry — the oldest
+/// sequence is always covered in full, so the pool provably keeps draining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvAdmission {
+    Reserve,
+    Elastic,
+}
+
 /// The KV block budget a batched decoder reports: how many blocks its pool holds and how many
 /// tokens each covers. Plain numbers — the engine does block arithmetic with them, but blocks
 /// themselves never cross the decoder trait; which physical block a token lands in is the model's
@@ -163,6 +174,14 @@ pub trait BatchedInferenceServer: InferenceServer {
         0
     }
 
+    /// Which KV admission policy the worker runs for this server (see [`KvAdmission`]). Elastic is
+    /// the default: it is what makes a block pool worth having — capacity tracks what sequences
+    /// actually use instead of what they might. A server whose deployment wants the strict
+    /// no-pause guarantee overrides this to `Reserve`.
+    fn kv_admission(&self) -> KvAdmission {
+        KvAdmission::Elastic
+    }
+
     /// Tokenize a submitted task into the token ids the decoder consumes.
     ///
     /// This is a thin wrapper over the model's own tokenizer. It is a primitive the continuous loop
@@ -242,6 +261,12 @@ pub struct ActiveSeq<Extra = ()> {
     /// covers, so whenever admission's arithmetic says a sequence fits, the pool physically has the
     /// blocks — pool exhaustion is unreachable for live sequences.
     pub kv_reservation: usize,
+    /// Set by the driver when this sequence must sit a round out because growing it would take a
+    /// KV block the pool cannot spare right now (elastic admission). A paused sequence keeps its
+    /// slot, its blocks, and its stream; it simply doesn't join the fused decode until the driver
+    /// clears the flag — typically after a retirement frees blocks. `step_round` never sets or
+    /// clears this; pausing is admission policy, and admission belongs to the driver.
+    pub paused: bool,
     /// The driver-owned payload (emitter and completion, generation context). Opaque to
     /// `step_round`.
     pub extra: Extra,
@@ -369,6 +394,9 @@ pub fn step_round<D: BatchedDecoder, X>(
     let mut decode_rows: Vec<(usize, DecodeRow)> = Vec::new();
     for (i, seq) in active.iter_mut().enumerate() {
         if seq.finished {
+            continue;
+        }
+        if seq.paused {
             continue;
         }
         if seq.generated >= seq.max_gen || seq.processed >= seq.tokens.len() {
