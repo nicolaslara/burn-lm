@@ -86,6 +86,11 @@ mod llama_sampler {
             // only reads back the final `[rows, 1]` token ids.
             let [rows, vocab] = logits.dims();
             let device = logits.device();
+            // Half-precision floats underflow below ~6e-5, which real nucleus tails routinely
+            // cross, and the Gumbel trick needs `log(-log(u))` of numbers near 1. Run the whole
+            // stochastic computation in f32 regardless of the model's dtype; the winner is an
+            // index, so nothing half-precision survives into the output.
+            let logits = logits.cast(burn::tensor::FloatDType::F32);
             let probs = temperature_scaled_softmax(logits, self.settings.temperature);
 
             // Sort every row's vocabulary by probability so the nucleus is a contiguous leading run,
