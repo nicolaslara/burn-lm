@@ -46,8 +46,10 @@ impl FeedForward {
         // M=1 rows re-streaming the weights per lane — same fix as the LM head, ~80% of each
         // layer's weight bytes.
         let [b, s, d] = input.dims();
-        let hidden = self.swiglu.forward(input.reshape([b * s, d]));
-        let out = self.w2.forward(hidden);
+        let x = input.reshape([b * s, d]);
+        let inner = burn::tensor::activation::silu(crate::nn::linear_f32(&self.swiglu.linear_inner, x.clone()));
+        let hidden = inner * crate::nn::linear_f32(&self.swiglu.linear_outer, x);
+        let out = crate::nn::linear_f32(&self.w2, hidden);
         let k = out.dims()[1];
         out.reshape([b, s, k])
     }

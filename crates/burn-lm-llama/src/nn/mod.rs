@@ -26,7 +26,23 @@ pub(crate) fn linear_flat(
     x: burn::tensor::Tensor<3>,
 ) -> burn::tensor::Tensor<3> {
     let [b, s, d] = x.dims();
-    let y = linear.forward(x.reshape([b * s, d]));
+    let y = linear_f32(linear, x.reshape([b * s, d]));
     let k = y.dims()[1];
     y.reshape([b, s, k])
 }
+/// DEBUG EXPERIMENT: run a `Linear` with f32 operands regardless of the model dtype, so its dot
+/// products cannot overflow f16 and accumulate in f32. Everything around it stays in the model
+/// dtype. bf16 (f32 exponent range) is correct on CUDA where f16 is not, and burn's RMSNorm
+/// already computes its variance in f32, so the tensor-core f16 GEMM path is the prime suspect.
+pub(crate) fn linear_f32(linear: &burn::nn::Linear, x: burn::tensor::Tensor<2>) -> burn::tensor::Tensor<2> {
+    use burn::tensor::FloatDType;
+    let dtype = FloatDType::try_from(x.dtype()).expect("float tensor");
+    let w = linear.weight.val().cast(FloatDType::F32);
+    let y = x.cast(FloatDType::F32).matmul(w);
+    let y = match &linear.bias {
+        Some(b) => y + b.val().cast(FloatDType::F32).unsqueeze(),
+        None => y,
+    };
+    y.cast(dtype)
+}
+
