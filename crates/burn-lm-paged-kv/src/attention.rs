@@ -9,7 +9,7 @@
 //! function, gated by the same equivalence suites that gate this one. Nothing outside this module
 //! may assume the scratch (or any other intermediate) exists.
 
-use burn::tensor::Tensor;
+use burn::tensor::{module::attention, ops::AttentionModuleOptions, Tensor};
 
 use crate::cache::LanePlan;
 use crate::kv_cache::KeyValueCache;
@@ -36,15 +36,15 @@ pub fn paged_attention(
     let (k, v) = cache.gather(plan);
     let k = repeat_kv(k, n_rep);
     let v = repeat_kv(v, n_rep);
-    // DEBUG EXPERIMENT: bypass the backend's fused attention op and spell attention out in plain
-    // tensor ops, so a wrong answer on CUDA f16 can be attributed to (or cleared of) the fused
-    // kernel's mask handling. Same math, same dtype, same mask semantics (true = masked out).
-    let head_dim = q.dims()[3];
-    let scale = 1.0 / (head_dim as f64).sqrt();
-    let scores = q.matmul(k.swap_dims(2, 3)) * scale; // [n, heads, seq, l_max]
-    let scores = scores.mask_fill(plan.mask.clone(), f32::NEG_INFINITY);
-    let probs = burn::tensor::activation::softmax(scores, 3);
-    probs.matmul(v)
+    // plan.mask is [n, 1, seq_len, l_max]; broadcasts over heads inside the attention op.
+    attention(
+        q,
+        k,
+        v,
+        Some(plan.mask.clone()),
+        None,
+        AttentionModuleOptions::default(),
+    )
 }
 
 /// Repeat each KV head `n_rep` times for grouped-query attention. Part of the reference
