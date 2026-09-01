@@ -157,12 +157,24 @@ async fn handle_non_streaming_response(
         generation_params(&payload.params),
         TextGenerationListener::default(),
     );
+    // `run_job` blocks until the whole generation is done. Run it on the blocking pool, like the
+    // streaming path does: called directly here it would park one of the runtime's few worker
+    // threads for the request's entire lifetime, and concurrent non-streaming requests would then
+    // serialize on the runtime — one full generation at a time — however wide the engine batches.
+    // (Measured: an exact ~1 s-per-request ladder on an A10G with plenty of lanes free.)
+    //
     // Map inference failures to HTTP errors instead of unwrapping: a shed job (`Overloaded`)
     // must become a 429, not a panicking handler — panicking here would defeat backpressure.
-    let stats = plugin
-        .run_job(job)
-        .map_err(crate::errors::ServerError::from)?;
-    let content = handle.join();
+    let (stats, content) = tokio::task::spawn_blocking(move || {
+        let stats = plugin
+            .run_job(job)
+            .map_err(crate::errors::ServerError::from)?;
+        Ok::<_, crate::errors::ServerError>((stats, handle.join()))
+    })
+    .await
+    .map_err(|join_err| {
+        crate::errors::ServerError::Inference(format!("generation task panicked: {join_err}"))
+    })??;
 
     tracing::debug!("Answer: {}", content);
     let response = ChatCompletionSchema {
