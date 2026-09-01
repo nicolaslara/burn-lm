@@ -105,7 +105,7 @@ impl App {
 
     /// Create and start the application HTTP server
     pub async fn serve(self) -> Result<(), Box<dyn std::error::Error>> {
-        let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
+        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
         let banner = r#"
 
   ██████╗ ██╗   ██╗██████╗ ███╗   ██╗    ██╗     ███╗   ███╗
