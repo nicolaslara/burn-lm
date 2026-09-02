@@ -1,6 +1,6 @@
 use burn::{
     module::{Module, Quantizer},
-    record::{FileRecorder, RecorderError},
+    store::RecordError,
     tensor::{
         quantization::{Calibration, QuantScheme},
         Device, Int, Shape, Tensor, TensorData,
@@ -152,27 +152,39 @@ impl<T: Tokenizer> Llama<T> {
         Tensor::<1, Int>::from_data(TensorData::new(tokens, shape), &self.decoder.device)
     }
 
-    /// Save Llama model to file using the specified recorder.
-    pub fn save<R: FileRecorder>(self, file_path: &str, recorder: &R) -> Result<(), RecorderError> {
+    /// Save the model weights to a burnpack file (`.bpk` is appended when `file_path` has no
+    /// extension). This is burn's current record format; `load` reads it back, along with the
+    /// legacy `.mpk` files the published checkpoints still use.
+    pub fn save(self, file_path: &str) -> Result<(), RecordError> {
         println!("Saving record...");
         let now = Instant::now();
-        self.decoder.model.save_file(file_path, recorder)?;
+        self.decoder.model.save_file(file_path)?;
         let elapsed = now.elapsed().as_secs();
         println!("Saved in {elapsed}s");
 
         Ok(())
     }
 
-    /// Load Llama model from file using the specified recorder.
-    pub fn load<R: FileRecorder>(
-        mut self,
-        file_path: &str,
-        recorder: &R,
-    ) -> Result<Self, RecorderError> {
-        self.decoder.model =
-            self.decoder
+    /// Load the model weights from `file_path`. A `.mpk` file is the msgpack format older burn
+    /// versions wrote (what the published checkpoints are, see `legacy_mpk`); anything else is read
+    /// as a burnpack record. As the old recorder did, a path without an extension means `.mpk`.
+    pub fn load(mut self, file_path: &str) -> Result<Self, String> {
+        let mut path = std::path::PathBuf::from(file_path);
+        if path.extension().is_none() {
+            path.set_extension("mpk");
+        }
+
+        if path.extension().is_some_and(|ext| ext == "mpk") {
+            super::legacy_mpk::load_into(&mut self.decoder.model, &path, &self.decoder.device)?;
+        } else {
+            let record = burn::store::ModuleRecord::load(&path)
+                .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+            self.decoder.model = self
+                .decoder
                 .model
-                .load_file(file_path, recorder, &self.decoder.device)?;
+                .try_load_record(record)
+                .map_err(|err| format!("failed to apply {}: {err}", path.display()))?;
+        }
         Ok(self)
     }
 
@@ -183,11 +195,7 @@ impl<T: Tokenizer> Llama<T> {
 
     /// Quantize the model weights.
     pub fn quantize(mut self, scheme: QuantScheme) -> Self {
-        let calibration = Calibration::MinMax;
-        let mut quantizer = Quantizer {
-            calibration,
-            scheme,
-        };
+        let mut quantizer = Quantizer::new(Calibration::MinMax, scheme);
         let device = &self.decoder.model.devices()[0];
 
         // TODO: improve module mapper usage for quantization (currently, this leads to additional memory usage)

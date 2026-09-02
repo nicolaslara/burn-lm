@@ -13,8 +13,6 @@ use burn::{config::Config, nn::RotaryEncodingConfig, tensor::Device};
 use crate::tokenizer::SentencePieceTokenizer;
 #[cfg(feature = "llama3")]
 use crate::tokenizer::Tiktoken;
-#[cfg(feature = "llama3")]
-use burn::record::HalfPrecisionSettings;
 
 #[derive(Clone, Debug, Default)]
 /// Llama-3 model variants to load.
@@ -155,17 +153,14 @@ impl LlamaConfig {
         kv_pool_tokens: usize,
         device: &Device,
     ) -> Result<inference::Llama<Tiktoken>, String> {
-        use burn::record::NamedMpkFileRecorder;
-
         let llama = Self::llama3_2_3b(tokenizer_path)
             .with_max_seq_len(max_seq_len)
             .with_max_batch_size(max_batch_size)
             .with_kv_pool_tokens(kv_pool_tokens)
             .init::<Tiktoken>(device)?;
 
-        let recorder = NamedMpkFileRecorder::<HalfPrecisionSettings>::new();
         let llama = llama
-            .load(checkpoint, &recorder)
+            .load(checkpoint)
             .map_err(|err| format!("Failed to load pre-trained Llama model.\nError: {err}"))?;
 
         Ok(llama)
@@ -181,17 +176,14 @@ impl LlamaConfig {
         kv_pool_tokens: usize,
         device: &Device,
     ) -> Result<inference::Llama<Tiktoken>, String> {
-        use burn::record::NamedMpkFileRecorder;
-
         let llama = Self::llama3_2_1b(tokenizer_path)
             .with_max_seq_len(max_seq_len)
             .with_max_batch_size(max_batch_size)
             .with_kv_pool_tokens(kv_pool_tokens)
             .init::<Tiktoken>(device)?;
 
-        let recorder = NamedMpkFileRecorder::<HalfPrecisionSettings>::new();
         let llama = llama
-            .load(checkpoint, &recorder)
+            .load(checkpoint)
             .map_err(|err| format!("Failed to load pre-trained Llama model.\nError: {err}"))?;
 
         Ok(llama)
@@ -207,17 +199,14 @@ impl LlamaConfig {
         kv_pool_tokens: usize,
         device: &Device,
     ) -> Result<inference::Llama<Tiktoken>, String> {
-        use burn::record::NamedMpkFileRecorder;
-
         let llama = Self::llama3_1_8b(tokenizer_path)
             .with_max_seq_len(max_seq_len)
             .with_max_batch_size(max_batch_size)
             .with_kv_pool_tokens(kv_pool_tokens)
             .init::<Tiktoken>(device)?;
 
-        let recorder = NamedMpkFileRecorder::<HalfPrecisionSettings>::new();
         let llama = llama
-            .load(checkpoint, &recorder)
+            .load(checkpoint)
             .map_err(|err| format!("Failed to load pre-trained Llama model.\nError: {err}"))?;
 
         Ok(llama)
@@ -233,17 +222,14 @@ impl LlamaConfig {
         kv_pool_tokens: usize,
         device: &Device,
     ) -> Result<inference::Llama<Tiktoken>, String> {
-        use burn::record::NamedMpkFileRecorder;
-
         let llama = Self::llama3_8b(tokenizer_path)
             .with_max_seq_len(max_seq_len)
             .with_max_batch_size(max_batch_size)
             .with_kv_pool_tokens(kv_pool_tokens)
             .init::<Tiktoken>(device)?;
 
-        let recorder = NamedMpkFileRecorder::<HalfPrecisionSettings>::new();
         let llama = llama
-            .load(checkpoint, &recorder)
+            .load(checkpoint)
             .map_err(|err| format!("Failed to load pre-trained Llama model.\nError: {err}"))?;
 
         Ok(llama)
@@ -257,15 +243,12 @@ impl LlamaConfig {
         max_seq_len: usize,
         device: &Device,
     ) -> Result<inference::Llama<SentencePieceTokenizer>, String> {
-        use burn::record::NamedMpkFileRecorder;
-
         let llama = Self::tiny_llama(tokenizer_path)
             .with_max_seq_len(max_seq_len)
             .init::<SentencePieceTokenizer>(device)?;
 
-        let recorder = NamedMpkFileRecorder::<HalfPrecisionSettings>::new();
         let llama = llama
-            .load(checkpoint, &recorder)
+            .load(checkpoint)
             .map_err(|err| format!("Failed to load pre-trained Llama model.\nError: {err}"))?;
 
         Ok(llama)

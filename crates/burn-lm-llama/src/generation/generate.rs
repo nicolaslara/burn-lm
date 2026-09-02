@@ -90,7 +90,7 @@ impl<T: Tokenizer + 'static> Llama<T> {
                     .tokenize(prompt)
                     .into_data()
                     .convert::<u32>()
-                    .into_vec::<u32>()
+                    .try_into_vec::<u32>()
                     .expect("prompt tokens should convert to u32");
                 let state = GenerationContext::new(emitter, self.tokenizer.clone());
                 ActiveSeq {
