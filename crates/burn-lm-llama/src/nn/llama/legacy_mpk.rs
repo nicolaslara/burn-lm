@@ -7,9 +7,11 @@
 //! the burnpack format, and offers no reader for the old files. Nothing upstream re-published the
 //! weights, so this module keeps them loadable.
 //!
-//! The on-disk shape is simple. A module is a map keyed by its field names; a `Vec` of modules is
-//! an array; `Option::None` and constant fields (`usize`, `f64`) are nil or scalars; and every
-//! parameter is a two-key map `{ "id": "<param id>", "param": <TensorData> }`. `TensorData` itself
+//! The on-disk shape is simple. The root is the recorder's own envelope, a map with a `metadata`
+//! entry (burn version, format, and the record type name) and an `item` entry holding the module.
+//! A module is a map keyed by its field names; a `Vec` of modules is an array; `Option::None` and
+//! constant fields (`usize`, `f64`) are nil or scalars; and every parameter is a two-key map
+//! `{ "id": "<param id>", "param": <TensorData> }`. `TensorData` itself
 //! (`bytes`, `shape`, `dtype`) still serializes exactly the same way in today's burn, so its own
 //! deserializer reads the leaves. We stream the document once, keep only the parameter leaves under
 //! their dotted path (`layers.0.attention.wq.weight`), and hand them to burn-store's applier, which
@@ -158,9 +160,18 @@ impl<'de, 'a> Visitor<'de> for NodeSeed<'a> {
 
         let mut key = first;
         loop {
-            self.0.path.push(key);
-            map.next_value_seed(NodeSeed(self.0))?;
-            self.0.path.pop();
+            // The envelope's `item` is the module itself, so its name is not part of any parameter
+            // path; `metadata` holds nothing to load.
+            let envelope = self.0.path.is_empty() && (key == "item" || key == "metadata");
+            if envelope && key == "metadata" {
+                map.next_value::<de::IgnoredAny>()?;
+            } else if envelope {
+                map.next_value_seed(NodeSeed(self.0))?;
+            } else {
+                self.0.path.push(key);
+                map.next_value_seed(NodeSeed(self.0))?;
+                self.0.path.pop();
+            }
             match map.next_key::<String>()? {
                 Some(next) => key = next,
                 None => return Ok(()),
