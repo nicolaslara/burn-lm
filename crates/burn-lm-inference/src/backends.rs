@@ -62,6 +62,10 @@ pub mod burn_backend_types {
     use super::*;
 
     pub type InferenceDevice = Device;
+    // burn deprecated its ndarray backend (tracel-ai/burn#5344) in favor of `Device::flex()`. We
+    // stay on ndarray on purpose: the test goldens and the CPU fallback were recorded against it,
+    // and moving the CPU backend is a decision to take separately, not as part of a version bump.
+    #[allow(deprecated)]
     pub static INFERENCE_DEVICE: LazyLock<Device> = LazyLock::new(|| configure(Device::ndarray()));
     pub const NAME: &str = "ndarray";
 }

@@ -48,7 +48,7 @@ impl Sampler for Argmax {
 pub fn ids_to_host(ids: Tensor<2, Int>) -> InferenceResult<Vec<u32>> {
     ids.into_data()
         .convert::<u32>()
-        .into_vec::<u32>()
+        .try_into_vec::<u32>()
         .map_err(|_| {
             InferenceError::BatchContractViolation(
                 "sampled token tensor did not convert to u32".to_string(),
