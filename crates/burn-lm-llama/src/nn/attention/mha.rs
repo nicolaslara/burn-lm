@@ -101,34 +101,18 @@ impl MultiHeadAttention {
         cache.write(plan, k, v);
         let output = paged_attention(q, cache, plan, self.n_heads / self.n_kv_heads);
 
-        // Flattened for the same reason as the projections: one weight read for the whole batch.
         let output = output
             .swap_dims(1, 2)
-            .reshape([n * seq_len, hidden_size]);
-        self.wo.forward(output).reshape([n, seq_len, hidden_size])
+            .reshape([n, seq_len, hidden_size]);
+        self.wo.forward(output)
     }
 
     fn forward_projection(&self, input: Tensor<3>) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
         let [batch_size, seq_len, _hidden_size] = input.dims();
 
-        // Flatten once and share the 2-D activation across all three projections: fed the 3-D
-        // shape, the matmul runs one single-row product per lane and re-reads the weights each
-        // time; flattened, one weight read serves the whole batch (see `nn::linear_flat`).
-        let [b_, s_, d_] = input.dims();
-        let input = input.reshape([b_ * s_, d_]);
         let q = self.wq.forward(input.clone());
         let k = self.wk.forward(input.clone());
         let v = self.wv.forward(input);
-        let (q, k, v) = {
-            let qk = q.dims()[1];
-            let kk = k.dims()[1];
-            let vk = v.dims()[1];
-            (
-                q.reshape([b_, s_, qk]),
-                k.reshape([b_, s_, kk]),
-                v.reshape([b_, s_, vk]),
-            )
-        };
 
         // [batch_size, num_heads, seq_len, head_dim]
         let q = q
