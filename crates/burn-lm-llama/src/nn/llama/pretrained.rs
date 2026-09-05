@@ -108,6 +108,20 @@ pub trait ModelMeta {
     fn pretrained(&self) -> Pretrained;
 }
 
+/// The local Q4 record to load in place of the published artifact, from
+/// `BURN_LM_LLAMA_Q4_CHECKPOINT`.
+///
+/// The published `q4fb32` `.mpk` stores its quantized tensors in a layout burn 0.22's reader
+/// refuses, so the working Q4 checkpoint is one produced locally (`cargo run --example quantize`)
+/// and named through this variable. Both the loader and the "is it downloaded?" check read it here,
+/// so a deployment pointing at a local record doesn't get told to download anything.
+pub fn q4_checkpoint_override() -> Option<std::path::PathBuf> {
+    std::env::var("BURN_LM_LLAMA_Q4_CHECKPOINT")
+        .ok()
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 impl ModelMeta for LlamaVersion {
     fn pretrained(&self) -> Pretrained {
         match self {
@@ -231,7 +245,12 @@ impl LlamaConfig {
         )
     }
 
-    /// Load pre-trained Llama-3.2-3B-Instruct model with [Tiktoken](https://github.com/openai/tiktoken) tokenizer.
+    /// Load the 4-bit quantized Llama-3.2-1B-Instruct model with
+    /// [Tiktoken](https://github.com/openai/tiktoken) tokenizer.
+    ///
+    /// Set `BURN_LM_LLAMA_Q4_CHECKPOINT` to a local record to load that instead of the published
+    /// artifact — which is what you want today, since the published one is in a quantization format
+    /// the current reader no longer accepts. `cargo run --example quantize` writes such a record.
     ///
     /// # Arguments
     /// - `max_seq_len` - The maximum sequence length for input text.
@@ -244,14 +263,32 @@ impl LlamaConfig {
         // Llama-3.2 models support context length up to 128K tokens.
         check_context_length(max_seq_len, 128 * 1024);
 
-        // Download checkpoint and tokenizer
-        let model = LlamaVersion::Llama321bInstructQ4FB32.pretrained();
-        let checkpoint = model
-            .download_weights()
-            .map_err(|err| format!("Could not download weights.\nError: {err}"))?;
-        let tokenizer = model
-            .download_tokenizer()
-            .map_err(|err| format!("Could not download tokenizer.\nError: {err}"))?;
+        // The published Q4 artifact is an old-format `.mpk` whose quantized tensors the current
+        // reader refuses (burn 0.22 reworked `QuantScheme`), so a working Q4 checkpoint has to be
+        // produced locally — `cargo run --example quantize` does it from the unquantized weights.
+        // `BURN_LM_LLAMA_Q4_CHECKPOINT` is how that local file gets used: point it at the record and
+        // this loads it instead of reaching for the published one. The tokenizer still comes from
+        // the unquantized repo, since it is the same file whatever the weights were quantized to and
+        // a local record carries weights only.
+        let (checkpoint, tokenizer) = match q4_checkpoint_override() {
+            Some(path) => {
+                let tokenizer = LlamaVersion::Llama321bInstruct
+                    .pretrained()
+                    .download_tokenizer()
+                    .map_err(|err| format!("Could not download tokenizer.\nError: {err}"))?;
+                (path, tokenizer)
+            }
+            None => {
+                let model = LlamaVersion::Llama321bInstructQ4FB32.pretrained();
+                let checkpoint = model
+                    .download_weights()
+                    .map_err(|err| format!("Could not download weights.\nError: {err}"))?;
+                let tokenizer = model
+                    .download_tokenizer()
+                    .map_err(|err| format!("Could not download tokenizer.\nError: {err}"))?;
+                (checkpoint, tokenizer)
+            }
+        };
 
         // The Q4 server is single-shot (not a `BatchedInferenceServer`), so it only ever drives lane
         // 0. A single-lane slab is correct and avoids eagerly allocating KV for lanes it can never

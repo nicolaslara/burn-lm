@@ -542,6 +542,15 @@ impl InferenceServer for Llama321bInstructQ4Server {
     }
 
     fn is_downloaded(&mut self) -> bool {
+        // A local record named by `BURN_LM_LLAMA_Q4_CHECKPOINT` is what "downloaded" means for this
+        // model today: the published artifact is in a quantization format the current reader
+        // refuses, so pointing at a locally produced record is the working configuration and the
+        // CLI must not offer to download over it. The tokenizer still comes from the unquantized
+        // repo and is small enough for the loader to fetch on demand, so only the record itself
+        // has to be on disk here.
+        if let Some(checkpoint) = crate::pretrained::q4_checkpoint_override() {
+            return checkpoint.exists();
+        }
         let model = LlamaVersion::Llama321bInstructQ4FB32.pretrained();
         model.is_downloaded()
     }
