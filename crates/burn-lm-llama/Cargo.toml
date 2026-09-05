@@ -93,3 +93,13 @@ tracing.workspace = true
 
 [dev-dependencies]
 clap = { version = "4.5.4", features = ["derive"] }
+
+# The examples drive the real model, so they need a tokenizer feature and a backend the model can
+# run on. `required-features` keeps them out of a plain `--all-targets` build instead of failing it.
+[[example]]
+name = "quantize"
+required-features = ["llama3"]
+
+[[example]]
+name = "generate"
+required-features = ["llama3", "inference-server"]
