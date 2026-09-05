@@ -1,6 +1,9 @@
+use std::path::{Path, PathBuf};
+
 use burn::prelude::*;
 
 use super::{inference::Llama, LlamaConfig, LlamaVersion, TinyLlamaVersion};
+use crate::nn::transformer::Transformer;
 
 #[cfg(feature = "llama3")]
 use crate::tokenizer::Tiktoken;
@@ -20,7 +23,6 @@ mod downloader {
     use burn::data::network::downloader;
     use std::fs::{create_dir_all, File};
     use std::io::Write;
-    use std::path::PathBuf;
 
     impl Pretrained {
         fn model_dir(&self) -> PathBuf {
@@ -92,6 +94,23 @@ mod downloader {
             self.download(self.tokenizer)
         }
 
+        /// The file to load the weights from: the burnpack copy of the downloaded checkpoint once
+        /// there is one, and the download itself otherwise.
+        ///
+        /// Every published artifact is still a legacy `.mpk` (see `legacy_mpk.rs`), and reading one
+        /// means walking a whole msgpack document and converting every tensor on the way in —
+        /// seconds of it, on every load. burnpack loads a fraction as slowly, so the first load
+        /// after a download writes the weights back out beside the `.mpk` (`cache_burnpack`) and
+        /// every load after that finds them here.
+        pub fn checkpoint(&self) -> Result<PathBuf, std::io::Error> {
+            let downloaded = self.download_weights()?;
+            let burnpack = burnpack_sibling(&downloaded);
+            if burnpack.exists() {
+                return Ok(burnpack);
+            }
+            Ok(downloaded)
+        }
+
         /// Delete the pre-trained model weights from the local cache directory.
         pub fn delete_weights(&self) -> Result<(), std::io::Error> {
             self.delete(self.model)
@@ -100,6 +119,59 @@ mod downloader {
         /// Delete the tokenizer from the local cache directory.
         pub fn delete_tokenizer(&self) -> Result<(), std::io::Error> {
             self.delete(self.tokenizer)
+        }
+    }
+}
+
+/// Where the burnpack copy of a cached checkpoint lives: the same path, with a `.bpk` extension.
+fn burnpack_sibling(checkpoint: &Path) -> PathBuf {
+    checkpoint.with_extension("bpk")
+}
+
+/// Write the freshly loaded weights back out as burnpack, beside the legacy checkpoint they came
+/// from, so the next load reads that instead.
+///
+/// Called once per cached model — after a load from a `.mpk`, and never after a load that already
+/// found the `.bpk`. It is best effort by design: the weights are in memory and the caller's load
+/// has succeeded, so a cache that cannot be written (read-only directory, full disk) costs a slow
+/// load next time and nothing else, which is what the current behavior already is.
+///
+/// The file appears atomically, written under a temporary name in the same directory and renamed
+/// once complete, because a half-written `.bpk` is worse than no `.bpk` at all: `checkpoint` would
+/// prefer it on the next run and the load would fail on a truncated file. The rename is within one
+/// directory, so it is the filesystem's own atomic swap.
+fn cache_burnpack(model: &Transformer, loaded_from: &Path) {
+    // Nothing to do when the load already took the fast path.
+    if loaded_from.extension().is_none_or(|ext| ext != "mpk") {
+        return;
+    }
+
+    let target = burnpack_sibling(loaded_from);
+    // The pid keeps two processes converting the same cache from writing to one another's file.
+    let temp = target.with_extension(format!("bpk.{}.tmp", std::process::id()));
+
+    let written = model
+        .clone()
+        .save_file(&temp)
+        .map_err(|err| err.to_string())
+        .and_then(|()| std::fs::rename(&temp, &target).map_err(|err| err.to_string()));
+
+    // Printed rather than logged, like the record save and load this sits between (see
+    // `Llama::save`): only the HTTP server installs a tracing subscriber, and a load that quietly
+    // spends seconds writing several gigabytes next to the checkpoint should say so.
+    match written {
+        Ok(()) => println!(
+            "Converted {} to {}. Later loads read the burnpack copy.",
+            loaded_from.display(),
+            target.display()
+        ),
+        Err(err) => {
+            let _ = std::fs::remove_file(&temp);
+            eprintln!(
+                "Could not write {}: {err}. The model is loaded; later loads keep reading {}.",
+                target.display(),
+                loaded_from.display()
+            );
         }
     }
 }
@@ -193,7 +265,7 @@ impl LlamaConfig {
         // Download checkpoint and tokenizer
         let model = LlamaVersion::Llama323bInstruct.pretrained();
         let checkpoint = model
-            .download_weights()
+            .checkpoint()
             .map_err(|err| format!("Could not download weights.\nError: {err}"))?;
         let tokenizer = model
             .download_tokenizer()
@@ -201,14 +273,17 @@ impl LlamaConfig {
 
         // `max_slots` sizes the shared KV slab: one lane per concurrent sequence the batched server
         // can admit. The 3b server passes its per-model slot count here (see its `Default`).
-        Self::load_llama3_2_3b(
+        let llama = Self::load_llama3_2_3b(
             checkpoint.to_str().unwrap(),
             tokenizer.to_str().unwrap(),
             max_seq_len,
             max_slots,
             kv_pool_tokens,
             device,
-        )
+        )?;
+        // Leave a burnpack copy behind when this came from the legacy `.mpk`.
+        cache_burnpack(&llama.decoder.model, &checkpoint);
+        Ok(llama)
     }
 
     /// Load pre-trained Llama-3.2-3B-Instruct model with [Tiktoken](https://github.com/openai/tiktoken) tokenizer.
@@ -229,20 +304,23 @@ impl LlamaConfig {
         // Download checkpoint and tokenizer
         let model = LlamaVersion::Llama321bInstruct.pretrained();
         let checkpoint = model
-            .download_weights()
+            .checkpoint()
             .map_err(|err| format!("Could not download weights.\nError: {err}"))?;
         let tokenizer = model
             .download_tokenizer()
             .map_err(|err| format!("Could not download tokenizer.\nError: {err}"))?;
 
-        Self::load_llama3_2_1b(
+        let llama = Self::load_llama3_2_1b(
             checkpoint.to_str().unwrap(),
             tokenizer.to_str().unwrap(),
             max_seq_len,
             max_batch_size,
             kv_pool_tokens,
             device,
-        )
+        )?;
+        // Leave a burnpack copy behind when this came from the legacy `.mpk`.
+        cache_burnpack(&llama.decoder.model, &checkpoint);
+        Ok(llama)
     }
 
     /// Load the 4-bit quantized Llama-3.2-1B-Instruct model with
@@ -281,7 +359,7 @@ impl LlamaConfig {
             None => {
                 let model = LlamaVersion::Llama321bInstructQ4FB32.pretrained();
                 let checkpoint = model
-                    .download_weights()
+                    .checkpoint()
                     .map_err(|err| format!("Could not download weights.\nError: {err}"))?;
                 let tokenizer = model
                     .download_tokenizer()
@@ -293,14 +371,17 @@ impl LlamaConfig {
         // The Q4 server is single-shot (not a `BatchedInferenceServer`), so it only ever drives lane
         // 0. A single-lane slab is correct and avoids eagerly allocating KV for lanes it can never
         // use — the opposite of what a quantized, memory-saving model wants.
-        Self::load_llama3_2_1b(
+        let llama = Self::load_llama3_2_1b(
             checkpoint.to_str().unwrap(),
             tokenizer.to_str().unwrap(),
             max_seq_len,
             1,
             0, // window-per-lane pool: one lane, one window — nothing to oversubscribe
             device,
-        )
+        )?;
+        // Leave a burnpack copy behind when this came from the legacy `.mpk`.
+        cache_burnpack(&llama.decoder.model, &checkpoint);
+        Ok(llama)
     }
 
     /// Load pre-trained Llama-3.1-8B-Instruct model with [Tiktoken](https://github.com/openai/tiktoken) tokenizer.
@@ -322,7 +403,7 @@ impl LlamaConfig {
         // Download checkpoint and tokenizer
         let model = LlamaVersion::Llama31Instruct.pretrained();
         let checkpoint = model
-            .download_weights()
+            .checkpoint()
             .map_err(|err| format!("Could not download weights.\nError: {err}"))?;
         let tokenizer = model
             .download_tokenizer()
@@ -330,14 +411,17 @@ impl LlamaConfig {
 
         // `max_slots` sizes the shared KV slab: one lane per concurrent sequence the batched server
         // can admit. The 3.1-8b server passes its per-model slot count here (see its `Default`).
-        Self::load_llama3_1_8b(
+        let llama = Self::load_llama3_1_8b(
             checkpoint.to_str().unwrap(),
             tokenizer.to_str().unwrap(),
             max_seq_len,
             max_slots,
             kv_pool_tokens,
             device,
-        )
+        )?;
+        // Leave a burnpack copy behind when this came from the legacy `.mpk`.
+        cache_burnpack(&llama.decoder.model, &checkpoint);
+        Ok(llama)
     }
 
     /// Load pre-trained Llama-3-8B-Instruct model with [Tiktoken](https://github.com/openai/tiktoken) tokenizer.
@@ -359,7 +443,7 @@ impl LlamaConfig {
         // Download checkpoint and tokenizer
         let model = LlamaVersion::Llama3Instruct.pretrained();
         let checkpoint = model
-            .download_weights()
+            .checkpoint()
             .map_err(|err| format!("Could not download weights.\nError: {err}"))?;
         let tokenizer = model
             .download_tokenizer()
@@ -367,14 +451,17 @@ impl LlamaConfig {
 
         // `max_slots` sizes the shared KV slab: one lane per concurrent sequence the batched server
         // can admit. The 8b server passes its per-model slot count here (see its `Default`).
-        Self::load_llama3_8b(
+        let llama = Self::load_llama3_8b(
             checkpoint.to_str().unwrap(),
             tokenizer.to_str().unwrap(),
             max_seq_len,
             max_slots,
             kv_pool_tokens,
             device,
-        )
+        )?;
+        // Leave a burnpack copy behind when this came from the legacy `.mpk`.
+        cache_burnpack(&llama.decoder.model, &checkpoint);
+        Ok(llama)
     }
 
     /// Load pre-trained TinyLlama-1.1B Chat v1.0 model with [SentenciePiece](https://github.com/google/sentencepiece) tokenizer.
@@ -390,17 +477,20 @@ impl LlamaConfig {
         // Download checkpoint and tokenizer
         let model = TinyLlamaVersion::V1.pretrained();
         let checkpoint = model
-            .download_weights()
+            .checkpoint()
             .map_err(|err| format!("Could not download weights.\nError: {err}"))?;
         let tokenizer = model
             .download_tokenizer()
             .map_err(|err| format!("Could not download tokenizer.\nError: {err}"))?;
 
-        Self::load_tiny_llama(
+        let llama = Self::load_tiny_llama(
             checkpoint.to_str().unwrap(),
             tokenizer.to_str().unwrap(),
             max_seq_len,
             device,
-        )
+        )?;
+        // Leave a burnpack copy behind when this came from the legacy `.mpk`.
+        cache_burnpack(&llama.decoder.model, &checkpoint);
+        Ok(llama)
     }
 }
