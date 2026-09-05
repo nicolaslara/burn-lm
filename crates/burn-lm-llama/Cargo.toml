@@ -27,7 +27,7 @@ llama3 = ["dep:tiktoken-rs", "dep:rustc-hash", "dep:base64"]
 tiny = ["dep:tokenizers"]
 
 # To import pytorch weights
-import = ["burn-store"]
+import = ["burn-store/pytorch"]
 
 # Feature flags for testing
 test-non-default = []
@@ -46,17 +46,25 @@ test-wgpu = [
     # "burn/autotune-checks",
     "test-non-default",
 ]
+# Bench/test on the same backend the Metal server uses.
+test-metal = [
+    "burn/metal",
+    "burn/default",
+    "test-non-default",
+]
 
 [dependencies]
+burn-lm-paged-kv = { path = "../burn-lm-paged-kv", version = "0.0.1" }
 burn = { workspace = true, features = [
     "std",
     "ndarray",
     "network",
     "dataset",
 ], default-features = false }
-burn-store = { workspace = true, default-features = false, features = [
-    "pytorch",
-], optional = true }
+# Always on: the published `.mpk` checkpoints are fed to the model through burn-store's applier
+# (see `nn/llama/legacy_mpk.rs`).
+burn-store = { workspace = true, default-features = false, features = ["std"] }
+rmp-serde = { workspace = true }
 itertools = { version = "0.12.1", default-features = false, features = [
     "use_alloc",
 ] }
