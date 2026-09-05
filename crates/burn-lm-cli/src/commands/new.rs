@@ -176,12 +176,7 @@ use burn_lm_macros::inference_server_registry;
 "#;
 
     #[rstest]
-    #[case::success_new_entry(
-        BASE_LIB_RS,
-        "burn_lm_inference_extra",
-        "ExtraServer",
-        true
-    )]
+    #[case::success_new_entry(BASE_LIB_RS, "burn_lm_inference_extra", "ExtraServer", true)]
     #[case::duplicate_entry(
         BASE_LIB_RS,
         "burn_lm_inference_llama3",

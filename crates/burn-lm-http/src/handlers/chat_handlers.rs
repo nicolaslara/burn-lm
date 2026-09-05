@@ -127,7 +127,6 @@ pub async fn chat_completions(
     }
 }
 
-
 /// The engine's finish-reason stat, mapped onto the OpenAI field. `Length` is the actionable one —
 /// the response was cut off by the token cap, and the client may continue with a follow-up request.
 /// Everything else (a stop token, a cancel from a client that already left) reads as a normal stop.

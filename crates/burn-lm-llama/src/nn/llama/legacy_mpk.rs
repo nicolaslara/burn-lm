@@ -37,8 +37,8 @@ use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visit
 /// Fails on a malformed file, a parameter the module does not have (or vice versa), a shape
 /// mismatch, or quantized weights.
 pub fn load_into<M: Module>(module: &mut M, path: &Path, device: &Device) -> Result<(), String> {
-    let file = File::open(path)
-        .map_err(|err| format!("could not open {}: {err}", path.display()))?;
+    let file =
+        File::open(path).map_err(|err| format!("could not open {}: {err}", path.display()))?;
     let mut reader = rmp_serde::Deserializer::new(BufReader::new(file));
 
     let mut walk = Walk {
@@ -52,7 +52,11 @@ pub fn load_into<M: Module>(module: &mut M, path: &Path, device: &Device) -> Res
 
     let result = module.apply(walk.tensors, None::<PathFilter>, None, false);
     if !result.errors.is_empty() {
-        return Err(format!("failed to apply {}: {:?}", path.display(), result.errors));
+        return Err(format!(
+            "failed to apply {}: {:?}",
+            path.display(),
+            result.errors
+        ));
     }
     if !result.missing.is_empty() {
         let missing: Vec<&str> = result.missing.iter().map(|(p, _)| p.as_str()).collect();

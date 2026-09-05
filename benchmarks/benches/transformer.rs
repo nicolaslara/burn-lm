@@ -126,7 +126,11 @@ fn bench(device: &Device, dtype: DType) -> Vec<BenchmarkResult> {
 
             // Prefill every lane to PROMPT_LEN through the real lane forward so the cache holds true
             // KV, then build the decode-round plan (one new token per lane).
-            let mut cache = PagedKvCache::with_default_blocks(config_transformer.kv_layout(), batch_size, device);
+            let mut cache = PagedKvCache::with_default_blocks(
+                config_transformer.kv_layout(),
+                batch_size,
+                device,
+            );
             for lane in 0..batch_size {
                 let prefill_plan = cache.prepare_lanes(&[lane], PROMPT_LEN).unwrap();
                 let prompt = Tensor::<2>::random(
@@ -160,6 +164,9 @@ fn bench(device: &Device, dtype: DType) -> Vec<BenchmarkResult> {
 fn main() {
     let device = Device::default();
     for result in bench(&device, DType::F32) {
-        println!("{}: mean {:?}, median {:?}", result.name, result.computed.mean, result.computed.median);
+        println!(
+            "{}: mean {:?}, median {:?}",
+            result.name, result.computed.mean, result.computed.median
+        );
     }
 }

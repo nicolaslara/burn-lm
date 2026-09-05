@@ -125,11 +125,7 @@ impl BlockPool {
         seq_len: usize,
     ) -> Result<Vec<usize>, PoolExhausted> {
         debug_assert!(
-            lanes
-                .iter()
-                .collect::<std::collections::HashSet<_>>()
-                .len()
-                == lanes.len(),
+            lanes.iter().collect::<std::collections::HashSet<_>>().len() == lanes.len(),
             "begin_round got a duplicate lane: {lanes:?}"
         );
         let mut grown: Vec<(usize, usize)> = Vec::with_capacity(lanes.len());
@@ -182,7 +178,10 @@ impl BlockPool {
         }
         for _ in 0..short {
             let block = self.free.pop().expect("checked above");
-            debug_assert_ne!(block, SENTINEL_BLOCK, "the sentinel must never be allocated");
+            debug_assert_ne!(
+                block, SENTINEL_BLOCK,
+                "the sentinel must never be allocated"
+            );
             self.tables[lane].push(block);
         }
         Ok(())
@@ -197,7 +196,10 @@ impl BlockPool {
             let total_usable = self.free.len() + self.tables.iter().map(Vec::len).sum::<usize>();
             let mut seen = vec![false; total_usable + 1 + SENTINEL_BLOCK as usize];
             let mut mark = |b: u32| {
-                assert_ne!(b, SENTINEL_BLOCK, "sentinel found in a table or the free stack");
+                assert_ne!(
+                    b, SENTINEL_BLOCK,
+                    "sentinel found in a table or the free stack"
+                );
                 let i = b as usize;
                 if i < seen.len() {
                     assert!(!seen[i], "block {b} owned twice");
@@ -242,7 +244,11 @@ mod tests {
         let starts = pool.begin_round(&[0], 1).unwrap(); // 9th token crosses into a third block
         assert_eq!(starts, vec![8]);
         assert_eq!(pool.lane_blocks(0).len(), 3);
-        assert_eq!(&pool.lane_blocks(0)[..2], before.as_slice(), "existing blocks keep their slots");
+        assert_eq!(
+            &pool.lane_blocks(0)[..2],
+            before.as_slice(),
+            "existing blocks keep their slots"
+        );
     }
 
     /// Exhaustion is all-or-nothing across the whole round: when one lane of a multi-lane round
@@ -258,7 +264,10 @@ mod tests {
         assert_eq!(err.short_by, 2);
         for lane in [1, 2] {
             assert_eq!(pool.lane_len(lane), 0, "lane {lane}: no length may survive");
-            assert!(pool.lane_blocks(lane).is_empty(), "lane {lane}: no block may survive");
+            assert!(
+                pool.lane_blocks(lane).is_empty(),
+                "lane {lane}: no block may survive"
+            );
         }
         assert_eq!(pool.free_blocks(), 2, "the free stack is exactly as it was");
         assert_eq!(pool.lane_len(0), 4, "an uninvolved lane is untouched");
@@ -311,6 +320,9 @@ mod tests {
         pool.begin_round(&[0], 2).unwrap(); // drain the pool
         assert_eq!(pool.free_blocks(), 0);
         assert!(pool.lane_blocks(0).iter().all(|&b| b != SENTINEL_BLOCK));
-        assert!(pool.begin_round(&[0], 1).is_err(), "nothing left but the sentinel");
+        assert!(
+            pool.begin_round(&[0], 1).is_err(),
+            "nothing left but the sentinel"
+        );
     }
 }

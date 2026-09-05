@@ -171,8 +171,18 @@ mod tests {
         let t0 = vec![3u32]; // lane 0 -> block 3
         let t2 = vec![1u32]; // lane 2 -> block 1
 
-        write(&mut store, std::slice::from_ref(&t0), &[0], Tensor::full([1, 1, 3, 2], 1.0, &device));
-        write(&mut store, std::slice::from_ref(&t2), &[0], Tensor::full([1, 1, 1, 2], 3.0, &device));
+        write(
+            &mut store,
+            std::slice::from_ref(&t0),
+            &[0],
+            Tensor::full([1, 1, 3, 2], 1.0, &device),
+        );
+        write(
+            &mut store,
+            std::slice::from_ref(&t2),
+            &[0],
+            Tensor::full([1, 1, 1, 2], 3.0, &device),
+        );
 
         // Fused decode write: one new position per active lane at each lane's own offset (3 and 1).
         let step = Tensor::<4>::from_data([[[[10.0, 10.0]]], [[[30.0, 30.0]]]], &device);
@@ -180,17 +190,25 @@ mod tests {
         write(&mut store, &tables, &[3, 1], step);
         let out = store.gather(idx_for(&tables, 1), 1, 4);
         assert_eq!(out.dims(), [2, 1, 4, 2]);
-        out.clone().slice([0..1, 0..1, 0..4, 0..2]).to_data().assert_eq(
-            &TensorData::from([[[[1.0f32, 1.0], [1.0, 1.0], [1.0, 1.0], [10.0, 10.0]]]]),
-            false,
-        );
+        out.clone()
+            .slice([0..1, 0..1, 0..4, 0..2])
+            .to_data()
+            .assert_eq(
+                &TensorData::from([[[[1.0f32, 1.0], [1.0, 1.0], [1.0, 1.0], [10.0, 10.0]]]]),
+                false,
+            );
         // Lane 2's columns 2..4 are stale tail the mask must cover — not asserted.
         out.slice([1..2, 0..1, 0..2, 0..2])
             .to_data()
             .assert_eq(&TensorData::from([[[[3.0f32, 3.0], [30.0, 30.0]]]]), false);
 
         // Lane 0's block is recycled from position 0, overwriting its old contents.
-        write(&mut store, std::slice::from_ref(&t0), &[0], Tensor::full([1, 1, 2, 2], 7.0, &device));
+        write(
+            &mut store,
+            std::slice::from_ref(&t0),
+            &[0],
+            Tensor::full([1, 1, 2, 2], 7.0, &device),
+        );
         let out = store.gather(idx_for(std::slice::from_ref(&t0), 1), 1, 2);
         out.to_data()
             .assert_eq(&TensorData::from([[[[7.0f32, 7.0], [7.0, 7.0]]]]), false);
@@ -212,8 +230,10 @@ mod tests {
         write(&mut store, std::slice::from_ref(&t0), &[2], vals(100, 2..4));
         write(&mut store, std::slice::from_ref(&t1), &[0], vals(200, 0..3));
 
-        let step =
-            Tensor::<4>::from_data(TensorData::new(vec![104.0f32, 203.0], [2, 1, 1, 1]), &device);
+        let step = Tensor::<4>::from_data(
+            TensorData::new(vec![104.0f32, 203.0], [2, 1, 1, 1]),
+            &device,
+        );
         let tables = [t0, t1];
         write(&mut store, &tables, &[4, 3], step);
         let out = store.gather(idx_for(&tables, 1), 1, 5);
@@ -239,15 +259,35 @@ mod tests {
         // Deliberately unordered, non-contiguous ids: position i·4.. lives in table[i].
         let table = vec![3u32, 1, 4];
 
-        write(&mut store, std::slice::from_ref(&table), &[0], vals(500, 0..2));
-        write(&mut store, std::slice::from_ref(&table), &[2], vals(500, 2..11));
+        write(
+            &mut store,
+            std::slice::from_ref(&table),
+            &[0],
+            vals(500, 0..2),
+        );
+        write(
+            &mut store,
+            std::slice::from_ref(&table),
+            &[2],
+            vals(500, 2..11),
+        );
         let out = store.gather(idx_for(std::slice::from_ref(&table), 3), 3, 11);
         assert_eq!(out.dims(), [1, 1, 11, 1]);
         out.to_data().assert_eq(&expect(500, 11), false);
 
-        write(&mut store, std::slice::from_ref(&table), &[11], vals(500, 11..12));
+        write(
+            &mut store,
+            std::slice::from_ref(&table),
+            &[11],
+            vals(500, 11..12),
+        );
         let grown = vec![3u32, 1, 4, 2];
-        write(&mut store, std::slice::from_ref(&grown), &[12], vals(500, 12..13));
+        write(
+            &mut store,
+            std::slice::from_ref(&grown),
+            &[12],
+            vals(500, 12..13),
+        );
         let out = store.gather(idx_for(std::slice::from_ref(&grown), 4), 4, 13);
         out.to_data().assert_eq(&expect(500, 13), false);
     }
@@ -261,12 +301,24 @@ mod tests {
         let long = vec![1u32, 2]; // positions 0..4
         let short = vec![3u32]; // positions 0..2
 
-        write(&mut store, std::slice::from_ref(&long), &[0], vals(700, 0..4));
-        write(&mut store, std::slice::from_ref(&short), &[0], vals(900, 0..1));
+        write(
+            &mut store,
+            std::slice::from_ref(&long),
+            &[0],
+            vals(700, 0..4),
+        );
+        write(
+            &mut store,
+            std::slice::from_ref(&short),
+            &[0],
+            vals(900, 0..1),
+        );
 
         let long_grown = vec![1u32, 2, 4];
-        let step =
-            Tensor::<4>::from_data(TensorData::new(vec![704.0f32, 901.0], [2, 1, 1, 1]), &device);
+        let step = Tensor::<4>::from_data(
+            TensorData::new(vec![704.0f32, 901.0], [2, 1, 1, 1]),
+            &device,
+        );
         let tables = [long_grown, short];
         write(&mut store, &tables, &[4, 1], step);
         let out = store.gather(idx_for(&tables, 3), 3, 5);

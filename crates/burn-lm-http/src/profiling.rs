@@ -79,13 +79,19 @@ async fn pprof_profile(Query(p): Query<ProfileParams>) -> impl IntoResponse {
     let profile = match report.pprof() {
         Ok(p) => p,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("pprof encode failed: {e}"))
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("pprof encode failed: {e}"),
+            )
                 .into_response()
         }
     };
     match profile.write_to_bytes() {
         Ok(body) => ([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("protobuf write failed: {e}"))
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("protobuf write failed: {e}"),
+        )
             .into_response(),
     }
 }
@@ -99,7 +105,10 @@ async fn pprof_flamegraph(Query(p): Query<ProfileParams>) -> impl IntoResponse {
     let mut svg = Vec::new();
     match report.flamegraph(&mut svg) {
         Ok(()) => ([(header::CONTENT_TYPE, "image/svg+xml")], svg).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("flamegraph failed: {e}"))
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("flamegraph failed: {e}"),
+        )
             .into_response(),
     }
 }

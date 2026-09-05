@@ -2,8 +2,8 @@ use serde::Deserialize;
 
 use crate::{
     generation::LlamaSampler,
-    nn::attention::DEFAULT_BLOCK_SIZE,
     inference::LlamaDecoder,
+    nn::attention::DEFAULT_BLOCK_SIZE,
     pretrained::ModelMeta,
     tokenizer::{Tiktoken, Tokenizer},
     LlamaConfig, LlamaVersion,
@@ -351,9 +351,13 @@ macro_rules! impl_batched_llama_server {
                 // the same env-overridden config values `load` uses — so the budget an early
                 // admission sees matches the pool that materializes.
                 let kv = match self.server.loaded_kv_budget() {
-                    Some((block_size, total_blocks)) => KvBudget { block_size, total_blocks },
+                    Some((block_size, total_blocks)) => KvBudget {
+                        block_size,
+                        total_blocks,
+                    },
                     None => {
-                        let max_seq_len = config_usize(self.config.max_seq_len, "BURN_LM_MAX_SEQ_LEN");
+                        let max_seq_len =
+                            config_usize(self.config.max_seq_len, "BURN_LM_MAX_SEQ_LEN");
                         let block_size = DEFAULT_BLOCK_SIZE.min(max_seq_len);
                         let pool_tokens =
                             config_usize(self.config.kv_pool_tokens, "BURN_LM_KV_POOL_TOKENS");
@@ -749,22 +753,34 @@ impl Llama3BaseServer {
             let kv_pool_tokens = config_usize(config.kv_pool_tokens, "BURN_LM_KV_POOL_TOKENS");
             tracing::info!(target: "batching", kv_pool_tokens, "kv pool tokens (0 = full rectangle)");
             let model = match self.version {
-                LlamaVersion::Llama3Instruct => {
-                    LlamaConfig::llama3_8b_pretrained(max_seq_len, max_slots, kv_pool_tokens, &*INFERENCE_DEVICE)
-                        .unwrap()
-                }
-                LlamaVersion::Llama31Instruct => {
-                    LlamaConfig::llama3_1_8b_pretrained(max_seq_len, max_slots, kv_pool_tokens, &*INFERENCE_DEVICE)
-                        .unwrap()
-                }
-                LlamaVersion::Llama323bInstruct => {
-                    LlamaConfig::llama3_2_3b_pretrained(max_seq_len, max_slots, kv_pool_tokens, &*INFERENCE_DEVICE)
-                        .unwrap()
-                }
-                LlamaVersion::Llama321bInstruct => {
-                    LlamaConfig::llama3_2_1b_pretrained(max_seq_len, max_slots, kv_pool_tokens, &*INFERENCE_DEVICE)
-                        .unwrap()
-                }
+                LlamaVersion::Llama3Instruct => LlamaConfig::llama3_8b_pretrained(
+                    max_seq_len,
+                    max_slots,
+                    kv_pool_tokens,
+                    &*INFERENCE_DEVICE,
+                )
+                .unwrap(),
+                LlamaVersion::Llama31Instruct => LlamaConfig::llama3_1_8b_pretrained(
+                    max_seq_len,
+                    max_slots,
+                    kv_pool_tokens,
+                    &*INFERENCE_DEVICE,
+                )
+                .unwrap(),
+                LlamaVersion::Llama323bInstruct => LlamaConfig::llama3_2_3b_pretrained(
+                    max_seq_len,
+                    max_slots,
+                    kv_pool_tokens,
+                    &*INFERENCE_DEVICE,
+                )
+                .unwrap(),
+                LlamaVersion::Llama321bInstruct => LlamaConfig::llama3_2_1b_pretrained(
+                    max_seq_len,
+                    max_slots,
+                    kv_pool_tokens,
+                    &*INFERENCE_DEVICE,
+                )
+                .unwrap(),
                 LlamaVersion::Llama321bInstructQ4FB32 => {
                     LlamaConfig::llama3_2_1b_pretrained_q4(max_seq_len, &*INFERENCE_DEVICE).unwrap()
                 }

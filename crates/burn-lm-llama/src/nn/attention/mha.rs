@@ -101,9 +101,7 @@ impl MultiHeadAttention {
         cache.write(plan, k, v);
         let output = paged_attention(q, cache, plan, self.n_heads / self.n_kv_heads);
 
-        let output = output
-            .swap_dims(1, 2)
-            .reshape([n, seq_len, hidden_size]);
+        let output = output.swap_dims(1, 2).reshape([n, seq_len, hidden_size]);
         self.wo.forward(output)
     }
 

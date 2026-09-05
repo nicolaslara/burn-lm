@@ -53,8 +53,7 @@ impl KeyValueCache {
         let seq_len = key.dims()[2];
         let ids = write_indices(tables, starts, seq_len, self.block_size);
         let n = ids.len() / 2;
-        let idx =
-            Tensor::<2, Int>::from_data(TensorData::new(ids, [n, 2]), &key.device());
+        let idx = Tensor::<2, Int>::from_data(TensorData::new(ids, [n, 2]), &key.device());
         self.key.write(&idx, key);
         self.value.write(&idx, value);
     }

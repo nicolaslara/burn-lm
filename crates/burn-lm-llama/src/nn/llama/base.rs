@@ -1,8 +1,8 @@
 use crate::{
     inference::{self, LlamaDecoder},
     nn::{
-        pos_encoding::{PositionalEncodingState, RopeConfig, RopeFrequencyScaling},
         attention::{PagedKvCache, DEFAULT_BLOCK_SIZE},
+        pos_encoding::{PositionalEncodingState, RopeConfig, RopeFrequencyScaling},
         transformer::TransformerConfig,
     },
     tokenizer::Tokenizer,

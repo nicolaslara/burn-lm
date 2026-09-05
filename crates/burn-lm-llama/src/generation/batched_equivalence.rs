@@ -386,7 +386,12 @@ fn chunked_run_on(
         } else {
             (position + chunk_size).min(prompt.len())
         };
-        last_out = Some(llama.decoder.prefill(0, &prompt[position..end], position).unwrap());
+        last_out = Some(
+            llama
+                .decoder
+                .prefill(0, &prompt[position..end], position)
+                .unwrap(),
+        );
         position = end;
     }
     let out = last_out.expect("prompt is non-empty");
@@ -397,7 +402,10 @@ fn chunked_run_on(
     for _ in 1..steps {
         let out = llama
             .decoder
-            .decode(&[DecodeRow { slot: 0, token: last }])
+            .decode(&[DecodeRow {
+                slot: 0,
+                token: last,
+            }])
             .unwrap();
         last = argmax_rows(&out)[0];
         tokens.push(last);
@@ -416,7 +424,10 @@ fn chunked_run_on(
 #[test]
 fn chunked_prefill_matches_monolithic_prefill() {
     let device: Device = Default::default();
-    let prompt = prompt_bytes("This is a sufficiently long prompt to split into prefill chunks", 48);
+    let prompt = prompt_bytes(
+        "This is a sufficiently long prompt to split into prefill chunks",
+        48,
+    );
     let steps = 20;
     let (ref_tokens, ref_logits) = reference_run(&prompt, steps, &device);
     // The token stream must be EXACT — that is the equivalence we guarantee. The per-step logits get a
@@ -482,7 +493,10 @@ fn small_block_paging_matches_batch1() {
 #[test]
 fn chunked_prefill_across_small_blocks_matches_monolithic() {
     let device: Device = Default::default();
-    let prompt = prompt_bytes("This is a sufficiently long prompt to split into prefill chunks", 48);
+    let prompt = prompt_bytes(
+        "This is a sufficiently long prompt to split into prefill chunks",
+        48,
+    );
     let steps = 12;
     let (ref_tokens, ref_logits) = reference_run(&prompt, steps, &device);
     // Same tolerance as the chunked-prefill gate: chunking reassociates the final chunk's attention
@@ -594,6 +608,3 @@ fn bench_real_weights_batched_decode_throughput() {
     let prompt: Vec<u32> = (0..16).map(|i| 1000 + i * 13).collect();
     run_bench(&prompt, 50, &mut llama.decoder);
 }
-
-
-

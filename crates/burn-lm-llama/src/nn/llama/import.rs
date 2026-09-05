@@ -15,7 +15,7 @@ use burn_store::{ModuleSnapshot, PytorchStore};
 
 use crate::tokenizer::Tokenizer;
 
-use super::{LlamaConfig, inference::Llama};
+use super::{inference::Llama, LlamaConfig};
 
 impl LlamaConfig {
     /// Load pre-trained Llama checkpoint.

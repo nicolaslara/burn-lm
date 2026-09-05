@@ -25,8 +25,7 @@ use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 
 use crate::{
-    errors::InferenceError, GeneratedItem, GeneratedItemEmitter, InferenceResult, Stats,
-    Utf8Buffer,
+    errors::InferenceError, GeneratedItem, GeneratedItemEmitter, InferenceResult, Stats, Utf8Buffer,
 };
 
 /// What the worker tells the emission thread. Events for one request arrive in order because the

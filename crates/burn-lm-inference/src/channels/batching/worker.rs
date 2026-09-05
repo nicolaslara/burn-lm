@@ -114,7 +114,15 @@ pub(super) fn spawn<S: BatchedInferenceServer + 'static>(seed: S) -> InferenceRe
                 // because nothing crossing the boundary is reused: the server is dropped on exit, and
                 // `queue`/`active` are only read to send `WorkerDied` replies, then cleared.
                 let flow = catch_unwind(AssertUnwindSafe(|| {
-                    worker_iteration(&mut server, &mut queue, &mut active, &mut resume, &receiver, &emission, &mut next_id)
+                    worker_iteration(
+                        &mut server,
+                        &mut queue,
+                        &mut active,
+                        &mut resume,
+                        &receiver,
+                        &emission,
+                        &mut next_id,
+                    )
                 }));
                 match flow {
                     Ok(Flow::Continue) => {}
@@ -165,8 +173,8 @@ fn worker_iteration<S: BatchedInferenceServer>(
     // us — so blocking now would sleep forever on work we could have run. Evicted sequences on
     // `resume` count as admittable for the same reason: their callers are waiting mid-stream and
     // no command will ever arrive on their behalf.
-    let can_admit =
-        (!queue.is_empty() || !resume.is_empty()) && server.batch_capacity().max_slots > active.len();
+    let can_admit = (!queue.is_empty() || !resume.is_empty())
+        && server.batch_capacity().max_slots > active.len();
     if active.is_empty() && !can_admit {
         match receiver.recv() {
             Ok(command) => {
@@ -304,7 +312,9 @@ fn admit<S: BatchedInferenceServer>(
         };
         let kv = server.batch_capacity().kv;
         let candidate = resume.last().expect("checked non-empty");
-        let guaranteed = if active.is_empty() || server.kv_admission() == crate::batching::KvAdmission::Reserve {
+        let guaranteed = if active.is_empty()
+            || server.kv_admission() == crate::batching::KvAdmission::Reserve
+        {
             let worst = candidate.tokens.len() + candidate.max_gen - candidate.generated;
             kv.blocks_for(worst.min(max_context_len))
         } else {
@@ -352,7 +362,10 @@ fn admit<S: BatchedInferenceServer>(
 
         // Cancelled while still queued: reply without touching the model — no prefill, no slot.
         // It never produced a token, so unlike an in-flight cancel this comes back as an error.
-        if queue.front().is_some_and(|front| front.job.cancel.is_cancelled()) {
+        if queue
+            .front()
+            .is_some_and(|front| front.job.cancel.is_cancelled())
+        {
             let cancelled = queue.pop_front().expect("checked above");
             let _ = cancelled.completion.send(Err(InferenceError::Cancelled));
             continue;
@@ -411,7 +424,9 @@ fn admit<S: BatchedInferenceServer>(
         // momentarily dry. The first sequence into an empty set always gets its full worst case —
         // that is the invariant that keeps the pool live: the oldest sequence can always finish,
         // and finishing frees blocks. `Reserve` mode guarantees the worst case for everyone.
-        let guaranteed = if active.is_empty() || server.kv_admission() == crate::batching::KvAdmission::Reserve {
+        let guaranteed = if active.is_empty()
+            || server.kv_admission() == crate::batching::KvAdmission::Reserve
+        {
             need
         } else {
             kv.blocks_for((tokens.len() + 1).min(max_context_len))
@@ -676,9 +691,14 @@ fn step<S: BatchedInferenceServer>(
             let mut budget = PrefillBudget::for_round(active);
             // The sampler carries no per-sequence state — any randomness it needs is drawn from the
             // backend RNG — so the round's whole job is to hand `step_round` the one shared sampler.
-            step_round(decoder, active, &stop_ids, &mut budget, chunk_size, |logits| {
-                sampler.sample(logits)
-            })
+            step_round(
+                decoder,
+                active,
+                &stop_ids,
+                &mut budget,
+                chunk_size,
+                |logits| sampler.sample(logits),
+            )
         }
         Err(err) => {
             // Couldn't borrow the decoder, so retire every sequence with this error. There's nothing
@@ -807,5 +827,3 @@ fn step<S: BatchedInferenceServer>(
         }
     }
 }
-
-

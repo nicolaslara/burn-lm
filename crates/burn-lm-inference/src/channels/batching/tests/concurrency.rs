@@ -99,7 +99,10 @@ fn a_request_larger_than_the_whole_pool_is_rejected_not_queued() {
     );
     rx_b.recv().unwrap().unwrap();
     let out = log.lock().unwrap().clone();
-    assert!(out.contains(&1), "the job behind the rejected one still runs: {out:?}");
+    assert!(
+        out.contains(&1),
+        "the job behind the rejected one still runs: {out:?}"
+    );
 }
 
 /// Capacity == 1: admission is one-at-a-time, so the two sequences run SERIALLY (no overlap).
@@ -611,16 +614,36 @@ fn chunked_prefill_defers_sampling_to_the_final_chunk() {
     let mut active = vec![seq((1..=10).collect(), 2)];
     for (round, expected) in [(1usize, 4usize), (2, 8)] {
         let mut budget = PrefillBudget::for_round(&active);
-        let outcomes = step_round(&mut decoder, &mut active, &[], &mut budget, chunk, argmax_rows);
+        let outcomes = step_round(
+            &mut decoder,
+            &mut active,
+            &[],
+            &mut budget,
+            chunk,
+            argmax_rows,
+        );
         assert!(
             matches!(outcomes[0], StepOutcome::Prefilling),
             "round {round}: an intermediate chunk should report Prefilling"
         );
-        assert_eq!(active[0].processed, expected, "round {round}: cursor advances by the chunk width");
-        assert_eq!(active[0].generated, 0, "round {round}: no token before the prompt is fully in");
+        assert_eq!(
+            active[0].processed, expected,
+            "round {round}: cursor advances by the chunk width"
+        );
+        assert_eq!(
+            active[0].generated, 0,
+            "round {round}: no token before the prompt is fully in"
+        );
     }
     let mut budget = PrefillBudget::for_round(&active);
-    let outcomes = step_round(&mut decoder, &mut active, &[], &mut budget, chunk, argmax_rows);
+    let outcomes = step_round(
+        &mut decoder,
+        &mut active,
+        &[],
+        &mut budget,
+        chunk,
+        argmax_rows,
+    );
     assert!(
         matches!(outcomes[0], StepOutcome::Stepped { .. }),
         "the final prefill chunk (two tokens left) samples the first generated token"
@@ -634,12 +657,26 @@ fn chunked_prefill_defers_sampling_to_the_final_chunk() {
     let mut active = vec![seq((1..=9).collect(), 2)];
     for expected in [4usize, 8] {
         let mut budget = PrefillBudget::for_round(&active);
-        let outcomes = step_round(&mut decoder, &mut active, &[], &mut budget, chunk, argmax_rows);
+        let outcomes = step_round(
+            &mut decoder,
+            &mut active,
+            &[],
+            &mut budget,
+            chunk,
+            argmax_rows,
+        );
         assert!(matches!(outcomes[0], StepOutcome::Prefilling));
         assert_eq!(active[0].processed, expected);
     }
     let mut budget = PrefillBudget::for_round(&active);
-    let outcomes = step_round(&mut decoder, &mut active, &[], &mut budget, chunk, argmax_rows);
+    let outcomes = step_round(
+        &mut decoder,
+        &mut active,
+        &[],
+        &mut budget,
+        chunk,
+        argmax_rows,
+    );
     assert!(
         matches!(outcomes[0], StepOutcome::Stepped { .. }),
         "a lone trailing prompt token is decoded, sampling the first generated token"
@@ -742,11 +779,15 @@ fn a_paused_sequence_resumes_and_completes_in_full() {
     let stats_a = rx_a.recv().unwrap().unwrap();
     let stats_b = rx_b.recv().unwrap().unwrap();
     assert!(
-        stats_a.entries.contains(&crate::stats::StatEntry::TokensCount(16)),
+        stats_a
+            .entries
+            .contains(&crate::stats::StatEntry::TokensCount(16)),
         "senior should generate its full budget"
     );
     assert!(
-        stats_b.entries.contains(&crate::stats::StatEntry::TokensCount(16)),
+        stats_b
+            .entries
+            .contains(&crate::stats::StatEntry::TokensCount(16)),
         "paused junior should still generate its full budget"
     );
 }
@@ -785,7 +826,9 @@ fn eviction_under_promotion_shortfall_completes_everyone() {
     for (rx, cap) in rxs.into_iter().zip(caps) {
         let stats = rx.recv().unwrap().unwrap();
         assert!(
-            stats.entries.contains(&crate::stats::StatEntry::TokensCount(cap)),
+            stats
+                .entries
+                .contains(&crate::stats::StatEntry::TokensCount(cap)),
             "every sequence must complete its exact budget (cap {cap})"
         );
     }

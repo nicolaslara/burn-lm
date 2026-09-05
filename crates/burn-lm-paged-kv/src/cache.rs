@@ -145,7 +145,10 @@ impl PagedKvCache {
             block_size >= 1 && block_size <= layout.max_seq_len,
             "block_size must be in 1..=max_seq_len"
         );
-        assert!(usable_blocks >= 1, "the pool needs at least one usable block");
+        assert!(
+            usable_blocks >= 1,
+            "the pool needs at least one usable block"
+        );
         let num_blocks = usable_blocks + 1; // plus the zeroed sentinel
         let layers = (0..layout.n_layers)
             .map(|_| {
@@ -235,12 +238,11 @@ impl PagedKvCache {
         // downstream never allocates. (While the pool matches the old rectangle it cannot actually
         // run dry — the ceiling check above fires first — but the rollback is the contract an
         // oversubscribed pool inherits.)
-        let starts = self
-            .pool
-            .begin_round(lanes, seq_len)
-            .map_err(|exhausted| PagedKvError::PoolExhausted {
+        let starts = self.pool.begin_round(lanes, seq_len).map_err(|exhausted| {
+            PagedKvError::PoolExhausted {
                 short_by: exhausted.short_by,
-            })?;
+            }
+        })?;
 
         let n = lanes.len();
         let l_max = starts.iter().map(|s| s + seq_len).max().expect("n >= 1");
@@ -414,7 +416,10 @@ mod tests {
 
         // Write real KV rows; the plan's starts come from this cache's lengths.
         let write = |cache: &mut PagedKvCache, lanes: &[usize], seq_len: usize| {
-            let x = Tensor::ones([lanes.len(), layout.n_kv_heads, seq_len, layout.head_dim], &device);
+            let x = Tensor::ones(
+                [lanes.len(), layout.n_kv_heads, seq_len, layout.head_dim],
+                &device,
+            );
             let plan = cache.prepare_lanes(lanes, seq_len).unwrap();
             for layer in cache.layers_mut() {
                 layer.write_lanes(&plan.tables, &plan.starts, x.clone(), x.clone());
@@ -468,13 +473,21 @@ mod tests {
             "expected a one-block shortfall: {err:?}"
         );
         for lane in 0..3 {
-            assert_eq!(cache.lane_len(lane), 0, "lane {lane}: no length may survive the rollback");
+            assert_eq!(
+                cache.lane_len(lane),
+                0,
+                "lane {lane}: no length may survive the rollback"
+            );
             assert!(
                 cache.pool.lane_blocks(lane).is_empty(),
                 "lane {lane}: no block may survive the rollback"
             );
         }
-        assert_eq!(cache.pool.free_blocks(), 2, "the free stack is exactly as it was");
+        assert_eq!(
+            cache.pool.free_blocks(),
+            2,
+            "the free stack is exactly as it was"
+        );
 
         // The pool still serves what fits: two lanes prefill fine after the failed round.
         let plan = cache.prepare_lanes(&[0, 1], 4).unwrap();

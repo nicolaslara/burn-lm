@@ -483,7 +483,11 @@ pub fn step_round<D: BatchedDecoder, X>(
         } else {
             (position + chunk_size).min(tail_len)
         };
-        let logits = decoder.prefill(active[i].slot, &active[i].tokens[position..chunk_end], position);
+        let logits = decoder.prefill(
+            active[i].slot,
+            &active[i].tokens[position..chunk_end],
+            position,
+        );
         if chunk_end < tail_len {
             // Intermediate chunk: the lane now holds `[0, chunk_end)`, but the prompt is not fully in
             // yet, so these logits are over a partial prefix and MUST be discarded — only the final

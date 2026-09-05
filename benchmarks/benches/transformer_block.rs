@@ -123,7 +123,8 @@ fn bench(device: &Device, dtype: DType) -> Vec<BenchmarkResult> {
                 config.n_heads_kv,
             )
             .with_max_seq_len(max_seq_length);
-            let mut tcache = PagedKvCache::with_default_blocks(tcfg.kv_layout(), batch_size, device);
+            let mut tcache =
+                PagedKvCache::with_default_blocks(tcfg.kv_layout(), batch_size, device);
             // Keep each lane's prefill plan: its block table is where the standalone KV cache
             // below must seed, so the seeding lands in the same blocks the decode plan addresses.
             let mut tables: Vec<Vec<u32>> = Vec::with_capacity(batch_size);
@@ -175,6 +176,9 @@ fn bench(device: &Device, dtype: DType) -> Vec<BenchmarkResult> {
 fn main() {
     let device = Device::default();
     for result in bench(&device, DType::F32) {
-        println!("{}: mean {:?}, median {:?}", result.name, result.computed.mean, result.computed.median);
+        println!(
+            "{}: mean {:?}, median {:?}",
+            result.name, result.computed.mean, result.computed.median
+        );
     }
 }

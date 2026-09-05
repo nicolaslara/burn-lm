@@ -3,7 +3,9 @@ use burn::{
     tensor::{DType, Device, Distribution, Tensor},
 };
 use burn_lm_llama::nn::{
-    attention::{KeyValueCache, LanePlan, MultiHeadAttention, MultiHeadAttentionConfig, PagedKvCache},
+    attention::{
+        KeyValueCache, LanePlan, MultiHeadAttention, MultiHeadAttentionConfig, PagedKvCache,
+    },
     transformer::TransformerConfig,
 };
 use burnbench::{run_benchmark, Benchmark, BenchmarkResult};
@@ -93,8 +95,7 @@ fn bench(device: &Device, dtype: DType) -> Vec<BenchmarkResult> {
             tables.push(plan.tables[0].clone());
         }
         let mut cache =
-            KeyValueCache::new(
-            batch_size + 1, n_kv_heads, max_seq_length, head_dim, device);
+            KeyValueCache::new(batch_size + 1, n_kv_heads, max_seq_length, head_dim, device);
         let lanes: Vec<usize> = (0..batch_size).collect();
         let prompt_kv = Tensor::<4>::random(
             [batch_size, n_kv_heads, PROMPT_LEN, head_dim],
@@ -133,6 +134,9 @@ fn bench(device: &Device, dtype: DType) -> Vec<BenchmarkResult> {
 fn main() {
     let device = Device::default();
     for result in bench(&device, DType::F32) {
-        println!("{}: mean {:?}, median {:?}", result.name, result.computed.mean, result.computed.median);
+        println!(
+            "{}: mean {:?}, median {:?}",
+            result.name, result.computed.mean, result.computed.median
+        );
     }
 }

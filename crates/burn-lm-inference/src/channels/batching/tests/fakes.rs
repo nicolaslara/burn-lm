@@ -533,7 +533,10 @@ impl BatchedInferenceServer for ByteServer {
     }
 
     fn batch_capacity(&self) -> BatchCapacity {
-        BatchCapacity { max_slots: 1, kv: KvBudget::unlimited() }
+        BatchCapacity {
+            max_slots: 1,
+            kv: KvBudget::unlimited(),
+        }
     }
 
     fn tokenize(&self, task: &InferenceTask) -> InferenceResult<Vec<u32>> {
