@@ -103,3 +103,7 @@ required-features = ["llama3"]
 [[example]]
 name = "generate"
 required-features = ["llama3", "inference-server"]
+
+[[example]]
+name = "convert"
+required-features = ["llama3"]
