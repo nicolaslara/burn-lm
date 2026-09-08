@@ -26,6 +26,18 @@ training = ["burn/train"]
 llama3 = ["dep:tiktoken-rs", "dep:rustc-hash", "dep:base64"]
 tiny = ["dep:tokenizers"]
 
+# Load a model straight out of a Hugging Face repo: the repo's own `config.json` and the canonical
+# safetensors weights, rather than a checkpoint someone converted to a burn-only format for us.
+# See `nn/llama/hf`.
+hf = [
+    "pretrained",
+    "dep:tokenizers",
+    "dep:serde_json",
+    "dep:reqwest",
+    "burn-store/safetensors",
+    "burn-store/memmap",
+]
+
 # To import pytorch weights
 import = ["burn-store/pytorch"]
 
@@ -80,8 +92,18 @@ tiktoken-rs = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 rustc-hash = { workspace = true, optional = true }
 
-# SentencePiece tokenizer (tiny llama / llama 2)
+# SentencePiece tokenizer (tiny llama / llama 2), and `tokenizer.json` for the Hugging Face path
 tokenizers = { workspace = true, features = ["onig"], optional = true }
+
+# Reading a repo's `config.json` (the `hf` feature)
+serde_json = { workspace = true, optional = true }
+# Fetching a repo's files. Already in the tree behind `burn/network`, whose own downloader buffers
+# the whole response in memory and panics on a dropped connection — neither of which suits a
+# multi-gigabyte checkpoint. Same TLS backend, so this adds no second stack.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "blocking",
+], optional = true }
 
 rand = { workspace = true, default-features = false, features = [
     "std_rng",
