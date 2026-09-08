@@ -1,13 +1,21 @@
-//! The paged-attention contract, with its reference implementation in generic tensor ops.
+//! The paged-attention contract: a kernel where there is one, generic tensor ops everywhere else.
 //!
-//! `paged_attention` is written to be REPLACED: its signature is the contract a dedicated kernel
-//! (cubecl) implements later — queries, the two block stores, and the round's plan in; attention
-//! output out. Today's body is the generic-op spelling of those semantics: gather each lane's
-//! blocks into a contiguous scratch, expand grouped-query heads, and run the backend's fused
-//! attention under the plan's mask. A real paged-attention kernel walks the block tables in-kernel
-//! instead — no scratch materialization, no head expansion — and swaps in behind this exact
-//! function, gated by the same equivalence suites that gate this one. Nothing outside this module
-//! may assume the scratch (or any other intermediate) exists.
+//! [`paged_attention`] is the contract, and its signature has not changed: queries, the two block
+//! stores, and the round's plan in; attention output out. What has changed is that a single-token
+//! round now offers the work to `burn-lm-paged-attn`'s decode kernel first, and only falls through
+//! to [`paged_attention_reference`] when the kernel declines.
+//!
+//! The reference is not legacy code. It is:
+//!
+//! - the prefill path (`seq_q > 1`), which the kernel does not serve;
+//! - the implementation for every backend and device the kernel does not cover;
+//! - the differential oracle the kernel is tested against.
+//!
+//! So it stays, verbatim, and it stays correct. That is the permanent cost of having two paths —
+//! and also the property that lets the kernel be deleted in one commit if its number disappoints.
+//!
+//! Nothing outside this module may assume the reference's scratch (or any other intermediate)
+//! exists; a round that took the kernel never materializes one.
 
 use burn::tensor::{module::attention, ops::AttentionModuleOptions, Bool, Tensor};
 
@@ -28,6 +36,55 @@ use crate::kv_cache::KeyValueCache;
 ///
 /// Returns `[n, num_heads, seq_len, head_dim]`.
 pub fn paged_attention(
+    q: Tensor<4>,
+    cache: &KeyValueCache,
+    plan: &LanePlan,
+    n_rep: usize,
+) -> Tensor<4> {
+    let [_n, _num_heads, seq_len, head_dim] = q.dims();
+
+    if seq_len == 1 {
+        // The decode kernel, if this build and this device have one. `paged_decode` answers `None`
+        // for every configuration it cannot serve — that is routine, not an error, and the
+        // fall-through below is the answer.
+        //
+        // The pool handles live and die inside this block, on purpose. `cache.write` has already
+        // run for this round (its caller does that before calling here), and `write` only skips a
+        // whole-pool copy while the pool handle is uniquely owned — so a handle held past this
+        // point would turn the *next* round's KV write into a copy-on-write of the entire pool.
+        // See `BlockStore::pool`.
+        let kernel_out = {
+            let (k_pool, v_pool) = cache.pools();
+            // Matches `AttentionModuleOptions::default()`: scale `1/sqrt(head_dim)`, no softcap,
+            // not `is_causal` — the length walk is the mask, and a single query position at the
+            // end of its own history has nothing causal left to hide.
+            let scale = (1.0 / (head_dim as f64).sqrt()) as f32;
+            burn_lm_paged_attn::paged_decode(
+                q.clone(),
+                k_pool,
+                v_pool,
+                plan.gather_idx.clone(),
+                plan.lengths.clone(),
+                n_rep,
+                scale,
+            )
+        };
+        if let Some(out) = kernel_out {
+            return out;
+        }
+    }
+
+    paged_attention_reference(q, cache, plan, n_rep)
+}
+
+/// The reference implementation, in generic tensor ops: gather each lane's blocks into a
+/// contiguous scratch, expand grouped-query heads, and run the backend's fused attention under the
+/// plan's mask.
+///
+/// Every copy a kernel exists to remove is visible here — the block gather, the token-major to
+/// head-major transpose, and the `n_rep`-fold head expansion — which is what makes this both the
+/// thing to beat and the thing to be checked against.
+pub fn paged_attention_reference(
     q: Tensor<4>,
     cache: &KeyValueCache,
     plan: &LanePlan,

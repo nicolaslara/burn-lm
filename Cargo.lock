@@ -1074,6 +1074,7 @@ name = "burn-lm-paged-kv"
 version = "0.0.1"
 dependencies = [
  "burn",
+ "burn-lm-paged-attn",
 ]
 
 [[package]]

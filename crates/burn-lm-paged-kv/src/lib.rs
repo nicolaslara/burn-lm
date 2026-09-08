@@ -33,7 +33,7 @@ mod block_store;
 mod cache;
 mod kv_cache;
 
-pub use attention::paged_attention;
+pub use attention::{paged_attention, paged_attention_reference};
 pub use block_pool::*;
 pub use cache::*;
 pub use kv_cache::*;

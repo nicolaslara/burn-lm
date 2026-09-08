@@ -58,6 +58,18 @@ impl KeyValueCache {
         self.value.write(&idx, value);
     }
 
+    /// The two raw block pools, K then V, `[num_blocks, block_size, num_heads, head_dim]` each.
+    ///
+    /// The read half of the paged cache as a *kernel* takes it: no gather, no transpose, no head
+    /// expansion — just the bytes, addressed by a block table. See [`BlockStore::pool`] for the
+    /// contract these handles come with; in short, they must be taken after this round's
+    /// [`write`](Self::write) and dropped before the next one, or every KV write becomes a
+    /// copy-on-write of the whole pool. `attention::paged_attention` is the only caller, and it
+    /// takes them inside the same expression that consumes them.
+    pub(crate) fn pools(&self) -> (Tensor<4>, Tensor<4>) {
+        (self.key.pool(), self.value.pool())
+    }
+
     /// Gather the plan's lanes out of both stores, `[n, num_heads, l_max, head_dim]` each. The
     /// read half of the paged cache — used by the reference `paged_attention`; a dedicated kernel
     /// reads the blocks in place instead.

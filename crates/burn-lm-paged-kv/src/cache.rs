@@ -71,6 +71,17 @@ pub struct LanePlan {
     /// The longest active lane's length after this forward — the width of the gathered KV and of
     /// the mask's last dimension.
     pub l_max: usize,
+    /// Per active lane, in `lanes` order: the lane's sequence length after this forward —
+    /// `starts[j] + seq_len` — as an `[n]` int tensor on the device.
+    ///
+    /// This is the [`mask`](Self::mask) with the padding removed rather than encoded: the mask
+    /// spells out `n · l_max` booleans to say where each lane stops, and a kernel that walks the
+    /// block table itself only needs the `n` stopping points. It is built in the same loop as
+    /// [`gather_idx`](Self::gather_idx), from the same `starts` snapshot, because a kernel trusts
+    /// it absolutely — it is the only thing standing between a lane and its neighbour's KV, so a
+    /// length built from a different round than the block table would read live data belonging to
+    /// another sequence rather than fail.
+    pub lengths: Tensor<1, Int>,
     /// The per-lane attention mask, shaped `[n, 1, q, l_max]`, where `true` means masked. Row `r` of
     /// lane `j` may attend to columns `0..=starts[j] + r`; everything past that is masked off — both
     /// the lane's own future and the stale tail out to the longest active lane. The attention op
@@ -274,18 +285,29 @@ impl PagedKvCache {
             .collect();
 
         // Prebuild the round's gather index — like the mask, a pure per-round artifact: every
-        // layer's K and V gather through this one uploaded tensor instead of rebuilding it.
+        // layer's K and V gather through this one uploaded tensor instead of rebuilding it — and,
+        // in the same pass, each lane's post-round length. One loop on purpose: the block table
+        // and the lengths are the two halves of one address, and a kernel that read them from
+        // different snapshots would walk into another lane's KV.
         let blocks_per_lane = l_max.div_ceil(self.pool.block_size());
-        let ids: Vec<i32> = tables
-            .iter()
-            .flat_map(|table| {
-                (0..blocks_per_lane).map(|i| *table.get(i).unwrap_or(&SENTINEL_BLOCK) as i32)
-            })
-            .collect();
+        let mut ids: Vec<i32> = Vec::with_capacity(n * blocks_per_lane);
+        let mut lens: Vec<i32> = Vec::with_capacity(n);
+        for (table, &start) in tables.iter().zip(starts.iter()) {
+            for i in 0..blocks_per_lane {
+                ids.push(*table.get(i).unwrap_or(&SENTINEL_BLOCK) as i32);
+            }
+            lens.push((start + seq_len) as i32);
+        }
+        debug_assert!(
+            lens.iter().all(|&len| len >= 1),
+            "every active lane holds at least this round's tokens: {lens:?}"
+        );
         let gather_idx = Tensor::<1, Int>::from_data(
             burn::tensor::TensorData::new(ids, [n * blocks_per_lane]),
             &self.device,
         );
+        let lengths =
+            Tensor::<1, Int>::from_data(burn::tensor::TensorData::new(lens, [n]), &self.device);
 
         // ...and the round's write index: every new token's (block, offset) destination, shared by
         // every layer's K and V scatter.
@@ -304,6 +326,7 @@ impl PagedKvCache {
             blocks_per_lane,
             write_idx,
             l_max,
+            lengths,
             mask,
         })
     }
