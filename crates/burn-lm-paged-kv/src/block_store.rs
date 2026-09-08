@@ -57,6 +57,19 @@ impl BlockStore {
             .inplace(|pool| pool.scatter_nd(idx, rows, IndexingUpdateOp::Assign));
     }
 
+    /// The raw pool tensor, `[num_blocks, block_size, num_heads, head_dim]`.
+    ///
+    /// For the paged-attention kernel, which addresses the blocks in place instead of gathering
+    /// them. The returned value is a handle (a refcount bump), not a copy — and that is exactly why
+    /// it must not be held: `write` mutates through `inplace`/`scatter_nd`, which only skips a full
+    /// copy while the pool handle is uniquely owned, so a clone kept alive across a later round's
+    /// writes turns every KV write into a copy-on-write of the whole pool. Take it, use it, drop
+    /// it, in that order, inside one call. Same contract as the clone in
+    /// [`gather`](Self::gather).
+    pub(crate) fn pool(&self) -> Tensor<4> {
+        self.pool.clone()
+    }
+
     /// Read `l_max` positions for each of `n` lanes as one `[n, num_heads, l_max, head_dim]`
     /// tensor, from a caller-built gather index: `idx` holds `n · blocks_per_lane` block ids, each
     /// lane's covering blocks in position order, short lanes padded with the sentinel. The index is
