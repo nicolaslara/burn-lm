@@ -1,0 +1,60 @@
+[package]
+name = "burn-lm-paged-attn"
+authors = []
+description = "A decode-only paged-attention kernel (cubecl) for burn-lm's paged KV cache: it walks each lane's block table in place, folds grouped-query heads, and masks by length instead of by a mask tensor."
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+
+# The kernel itself, plus the two backend implementations it needs (`CubeBackend<R>` and
+# `Fusion<B>`). Without this feature the crate is only the host gate and the plain-Rust oracle, and
+# `paged_decode` always answers `None` — which is exactly the "backend without the kernel" path the
+# reference implementation exists to serve.
+kernel = [
+    "dep:burn-cubecl",
+    "dep:burn-fusion",
+    "dep:burn-ir",
+    "dep:cubecl",
+    "dep:derive-new",
+    "burn/fusion",
+    "burn/ir",
+]
+
+# One feature per backend the extension trait lists. Each has to turn on the matching `burn`
+# feature, because the dispatch arm the macro generates names that backend's `DispatchTensorKind`
+# variant, and the availability probe names its cubecl runtime — both of which only exist when
+# `burn` was built with the backend. A build that enables `burn/metal` but not this crate's `metal`
+# compiles fine and takes the reference path; the model-level gate in the test suite is what keeps
+# that from going unnoticed.
+wgpu = ["kernel", "burn/wgpu", "cubecl/wgpu"]
+metal = ["wgpu", "burn/metal", "cubecl/metal"]
+vulkan = ["wgpu", "burn/vulkan", "cubecl/vulkan"]
+webgpu = ["wgpu", "burn/webgpu", "cubecl/webgpu"]
+cuda = ["kernel", "burn/cuda", "cubecl/cuda"]
+rocm = ["kernel", "burn/rocm", "cubecl/rocm"]
+
+[dependencies]
+burn = { workspace = true, features = [
+    "std",
+    "extension",
+], default-features = false }
+
+burn-cubecl = { version = "=0.22.0-pre.3", default-features = false, features = [
+    "std",
+    "fusion",
+], optional = true }
+burn-fusion = { version = "=0.22.0-pre.3", default-features = false, features = [
+    "std",
+], optional = true }
+burn-ir = { version = "=0.22.0-pre.3", default-features = false, features = [
+    "std",
+], optional = true }
+cubecl = { version = "=0.11.0-pre.3", default-features = false, features = [
+    "std",
+    "stdlib",
+], optional = true }
+derive-new = { version = "0.7", optional = true }
+log = { workspace = true }
