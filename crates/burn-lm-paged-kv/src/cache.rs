@@ -76,6 +76,11 @@ pub struct LanePlan {
     /// the lane's own future and the stale tail out to the longest active lane. The attention op
     /// turns masked positions into negative infinity before the softmax. Because the lanes are
     /// ragged, even a single-token decode round (`q == 1`) needs this mask to hide each lane's tail.
+    ///
+    /// The size-1 head axis is a storage decision, not a broadcast contract: heads are stored once
+    /// because every head of a lane sees the same columns, and a consumer is expected to widen the
+    /// axis to its own head count before handing the mask to an attention op (see
+    /// `attention::mask_over_heads` for why relying on the broadcast instead is a trap).
     pub mask: Tensor<4, Bool>,
 }
 
