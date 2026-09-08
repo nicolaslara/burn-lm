@@ -11,3 +11,8 @@ pub use tiktoken::*;
 pub mod sentence_piece;
 #[cfg(feature = "tiny")]
 pub use sentence_piece::*;
+
+#[cfg(feature = "hf")]
+pub mod hf;
+#[cfg(feature = "hf")]
+pub use hf::*;
