@@ -129,3 +129,8 @@ required-features = ["llama3", "inference-server"]
 [[example]]
 name = "convert"
 required-features = ["llama3"]
+
+[[example]]
+name = "generate-hf"
+path = "examples/generate_hf.rs"
+required-features = ["hf", "inference-server"]
