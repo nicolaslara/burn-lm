@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use burn::prelude::*;
 
-use super::{inference::Llama, LlamaConfig, LlamaVersion, TinyLlamaVersion};
+use super::{LlamaConfig, LlamaVersion, TinyLlamaVersion};
+// Only the per-model loaders below return one, and each of those is behind a tokenizer feature.
+#[cfg(any(feature = "llama3", feature = "tiny"))]
+use super::inference::Llama;
 use crate::nn::transformer::Transformer;
 
 #[cfg(feature = "llama3")]
@@ -140,13 +143,27 @@ fn burnpack_sibling(checkpoint: &Path) -> PathBuf {
 /// once complete, because a half-written `.bpk` is worse than no `.bpk` at all: `checkpoint` would
 /// prefer it on the next run and the load would fail on a truncated file. The rename is within one
 /// directory, so it is the filesystem's own atomic swap.
+#[cfg(any(feature = "llama3", feature = "tiny"))]
 fn cache_burnpack(model: &Transformer, loaded_from: &Path) {
     // Nothing to do when the load already took the fast path.
     if loaded_from.extension().is_none_or(|ext| ext != "mpk") {
         return;
     }
 
-    let target = burnpack_sibling(loaded_from);
+    write_burnpack(
+        model,
+        &burnpack_sibling(loaded_from),
+        &loaded_from.display().to_string(),
+    );
+}
+
+/// Write `model`'s weights to `target` as burnpack, best effort.
+///
+/// Split out of `cache_burnpack` so the Hugging Face loader can leave the same kind of cache behind
+/// (see `nn/llama/hf`), where the saving is larger still: reading the safetensors also costs a
+/// transpose, a dtype cast, and the rotary permutation, none of which the burnpack copy repeats.
+/// `source` only names what the weights came from, for the message.
+pub(super) fn write_burnpack(model: &Transformer, target: &Path, source: &str) {
     // The pid keeps two processes converting the same cache from writing to one another's file.
     let temp = target.with_extension(format!("bpk.{}.tmp", std::process::id()));
 
@@ -154,23 +171,22 @@ fn cache_burnpack(model: &Transformer, loaded_from: &Path) {
         .clone()
         .save_file(&temp)
         .map_err(|err| err.to_string())
-        .and_then(|()| std::fs::rename(&temp, &target).map_err(|err| err.to_string()));
+        .and_then(|()| std::fs::rename(&temp, target).map_err(|err| err.to_string()));
 
     // Printed rather than logged, like the record save and load this sits between (see
     // `Llama::save`): only the HTTP server installs a tracing subscriber, and a load that quietly
     // spends seconds writing several gigabytes next to the checkpoint should say so.
     match written {
         Ok(()) => println!(
-            "Converted {} to {}. Later loads read the burnpack copy.",
-            loaded_from.display(),
+            "Converted {source} to {}. Later loads read the burnpack copy.",
             target.display()
         ),
         Err(err) => {
             let _ = std::fs::remove_file(&temp);
             eprintln!(
-                "Could not write {}: {err}. The model is loaded; later loads keep reading {}.",
+                "Could not write {}: {err}. The model is loaded; later loads keep reading \
+                 {source}.",
                 target.display(),
-                loaded_from.display()
             );
         }
     }
@@ -238,6 +254,7 @@ impl ModelMeta for TinyLlamaVersion {
     }
 }
 
+#[cfg(any(feature = "llama3", feature = "tiny"))]
 fn check_context_length(max_seq_len: usize, max_context_len: usize) {
     assert!(
         max_seq_len <= max_context_len,
