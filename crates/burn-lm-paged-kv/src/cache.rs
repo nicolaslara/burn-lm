@@ -263,6 +263,15 @@ impl PagedKvCache {
         let n = lanes.len();
         let l_max = starts.iter().map(|s| s + seq_len).max().expect("n >= 1");
 
+        // `l_max` is the round's real attention width — the longest lane after this round's write,
+        // and therefore the length every lane's attention is padded out to. It is the one number
+        // that says how much work the attention step is actually doing, and nothing downstream
+        // reports it. Same `batching` target as the engine's round line so one filter shows both.
+        log::debug!(
+            target: "batching",
+            "plan n={n} seq_len={seq_len} l_max={l_max}"
+        );
+
         // Host-built per-lane causal + padding mask, `true` = masked.
         let mut mask_data = Vec::with_capacity(n * seq_len * l_max);
         for s in starts.iter() {
