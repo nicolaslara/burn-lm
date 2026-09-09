@@ -29,3 +29,4 @@ rocm = ["burn-lm-paged-attn/rocm"]
 [dependencies]
 burn = { workspace = true, features = ["std", "ndarray"], default-features = false }
 burn-lm-paged-attn = { path = "../burn-lm-paged-attn", version = "0.0.1" }
+log = { workspace = true }
