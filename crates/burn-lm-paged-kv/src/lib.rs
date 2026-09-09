@@ -54,6 +54,7 @@ mod kernel_tests;
 
 pub use attention::{paged_attention, paged_attention_reference};
 pub use block_pool::*;
+pub use block_store::RaggedKv;
 
 /// The decode kernel's switch and launch counter, re-exported so a model that owns a
 /// [`PagedKvCache`] can drive both implementations without depending on the kernel crate directly.

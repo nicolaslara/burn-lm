@@ -210,7 +210,10 @@ fn worst_lane_diff(a: &[f32], b: &[f32], n: usize) -> (usize, f32) {
     let per = a.len() / n;
     let mut worst = (0usize, 0.0f32);
     for lane in 0..n {
-        let d = max_norm_diff(&a[lane * per..(lane + 1) * per], &b[lane * per..(lane + 1) * per]);
+        let d = max_norm_diff(
+            &a[lane * per..(lane + 1) * per],
+            &b[lane * per..(lane + 1) * per],
+        );
         if d > worst.1 {
             worst = (lane, d);
         }
@@ -249,6 +252,7 @@ fn run_three_ways(case: &Case, device: &Device, seed: u64) -> (Vec<f32>, Vec<f32
 
     // The host twin, from the pools' actual bytes.
     let (k_pool, v_pool) = layer(&mut cache).pools();
+    let (k_pool, v_pool) = (k_pool.assume_length_gated(), v_pool.assume_length_gated());
     let k_host: Vec<f32> = k_pool.into_data().iter::<f32>().collect();
     let v_host: Vec<f32> = v_pool.into_data().iter::<f32>().collect();
     let q_host: Vec<f32> = q.clone().into_data().iter::<f32>().collect();
@@ -597,6 +601,7 @@ fn poisoned_padding_cannot_reach_the_kernel_output() {
         // as green as a kernel that genuinely never reads past a length.
         {
             let (k_pool, v_pool) = layer(&mut cache).pools();
+            let (k_pool, v_pool) = (k_pool.assume_length_gated(), v_pool.assume_length_gated());
             let poisoned_cells = k_pool
                 .into_data()
                 .iter::<f32>()
@@ -653,7 +658,7 @@ fn a_single_key_lane_returns_its_value_row_exactly() {
     for l in cache.layers_mut() {
         l.write(&plan, k.clone(), v.clone());
     }
-    let q = Tensor::<4>::from_data(TensorData::new(noise.vec(1 * 8 * 64), [1, 1, 8, 64]), &dev)
+    let q = Tensor::<4>::from_data(TensorData::new(noise.vec(8 * 64), [1, 1, 8, 64]), &dev)
         .swap_dims(1, 2);
 
     force_mode(PagedAttentionMode::Kernel);
@@ -698,6 +703,7 @@ fn pool_bytes_are_unchanged_by_a_kernel_decode() {
 
     let before = {
         let (k, v) = layer(&mut cache).pools();
+        let (k, v) = (k.assume_length_gated(), v.assume_length_gated());
         (
             k.into_data().iter::<f32>().collect::<Vec<f32>>(),
             v.into_data().iter::<f32>().collect::<Vec<f32>>(),
@@ -714,6 +720,7 @@ fn pool_bytes_are_unchanged_by_a_kernel_decode() {
 
     let after = {
         let (k, v) = layer(&mut cache).pools();
+        let (k, v) = (k.assume_length_gated(), v.assume_length_gated());
         (
             k.into_data().iter::<f32>().collect::<Vec<f32>>(),
             v.into_data().iter::<f32>().collect::<Vec<f32>>(),
@@ -834,6 +841,7 @@ fn extreme_scores_do_not_overflow_the_online_softmax() {
 
     // ...and it is still the right answer, against the host twin.
     let (k_pool, v_pool) = layer(&mut cache).pools();
+    let (k_pool, v_pool) = (k_pool.assume_length_gated(), v_pool.assume_length_gated());
     let out_twin = decode_reference_online(
         &q.into_data().iter::<f32>().collect::<Vec<f32>>(),
         &k_pool.into_data().iter::<f32>().collect::<Vec<f32>>(),
@@ -978,7 +986,10 @@ fn an_out_of_order_lane_subset_agrees_with_the_reference() {
     let n = lanes.len();
     let plan = cache.prepare_lanes(&lanes, 1).unwrap();
     let kv = Tensor::<4>::from_data(
-        TensorData::new(noise.vec(n * num_kv_heads * head_dim), [n, num_kv_heads, 1, head_dim]),
+        TensorData::new(
+            noise.vec(n * num_kv_heads * head_dim),
+            [n, num_kv_heads, 1, head_dim],
+        ),
         &dev,
     );
     for l in cache.layers_mut() {
@@ -986,7 +997,10 @@ fn an_out_of_order_lane_subset_agrees_with_the_reference() {
     }
     let num_heads = num_kv_heads * n_rep;
     let q = Tensor::<4>::from_data(
-        TensorData::new(noise.vec(n * num_heads * head_dim), [n, 1, num_heads, head_dim]),
+        TensorData::new(
+            noise.vec(n * num_heads * head_dim),
+            [n, 1, num_heads, head_dim],
+        ),
         &dev,
     )
     .swap_dims(1, 2);
@@ -1146,7 +1160,8 @@ fn a_plans_mask_lengths_and_block_table_agree() {
         let live = (len as usize).div_ceil(block_size);
         for entry in live..plan.blocks_per_lane {
             assert_eq!(
-                table[lane * plan.blocks_per_lane + entry], 0,
+                table[lane * plan.blocks_per_lane + entry],
+                0,
                 "lane {lane}: block table entry {entry} past the live prefix is not the sentinel"
             );
         }
