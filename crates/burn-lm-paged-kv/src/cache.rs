@@ -438,7 +438,7 @@ mod tests {
     /// single source of length, the freed lane's next write lands at offset 0.
     #[test]
     fn test_reset_lane_isolates_one_lane() {
-        let device: Device = Default::default();
+        let device = crate::test_device::test_device();
         let layout = lane_test_layout(8);
         let mut cache = PagedKvCache::with_default_blocks(layout, 2, &device);
 
