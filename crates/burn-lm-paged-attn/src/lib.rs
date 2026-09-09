@@ -128,6 +128,16 @@ pub fn paged_decode(
     {
         let device = q.device();
         if !backend::device_supports(&device, n, num_kv_heads, head_dim) {
+            // Say so once. This is the gate that turns "the kernel was asked for" into "the kernel
+            // never ran", and it is otherwise indistinguishable from "the kernel did not help".
+            static DECLINED: std::sync::Once = std::sync::Once::new();
+            DECLINED.call_once(|| {
+                log::warn!(
+                    "burn-lm paged decode: this device declines the kernel for n={n}, \
+                     num_kv_heads={num_kv_heads}, head_dim={head_dim}; using the reference \
+                     implementation"
+                );
+            });
             return None;
         }
         let out = <burn::backend::Dispatch as PagedDecodeAttention>::paged_decode(

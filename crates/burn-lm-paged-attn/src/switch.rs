@@ -22,8 +22,14 @@ pub enum PagedAttentionMode {
 /// something you ask for.
 fn parse_mode() -> PagedAttentionMode {
     match std::env::var("BURN_LM_PAGED_ATTENTION").as_deref() {
-        Ok("kernel") => PagedAttentionMode::Kernel,
-        Ok("reference") | Err(_) => PagedAttentionMode::Reference,
+        Ok("kernel") => {
+            log::info!("burn-lm paged decode: BURN_LM_PAGED_ATTENTION=kernel");
+            PagedAttentionMode::Kernel
+        }
+        Ok("reference") | Err(_) => {
+            log::info!("burn-lm paged decode: mode=reference (tensor-op path)");
+            PagedAttentionMode::Reference
+        }
         Ok(other) => {
             log::warn!(
                 "BURN_LM_PAGED_ATTENTION={other:?} is not one of `kernel` / `reference`; \
@@ -67,7 +73,16 @@ static LAUNCHES: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg_attr(not(feature = "kernel"), allow(dead_code))]
 pub(crate) fn count_launch() {
-    LAUNCHES.fetch_add(1, Ordering::Relaxed);
+    let previous = LAUNCHES.fetch_add(1, Ordering::Relaxed);
+    // The first launch is the one that matters: it is the only positive evidence that every gate
+    // between the env switch and the GPU said yes. After that, a decade-spaced heartbeat keeps the
+    // count visible in a long benchmark without writing a line per decode round.
+    if previous == 0 || (previous + 1) % 10_000 == 0 {
+        log::info!(
+            "burn-lm paged decode: kernel launches = {}",
+            previous + 1
+        );
+    }
 }
 
 /// How many times `paged_decode` has taken the kernel path in this process.
