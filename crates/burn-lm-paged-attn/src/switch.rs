@@ -1,5 +1,6 @@
 //! The opt-in switch, and the counter that keeps a silent fallback from being invisible.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
@@ -33,7 +34,31 @@ fn parse_mode() -> PagedAttentionMode {
     }
 }
 
+thread_local! {
+    /// This thread's override of the env switch, if it set one.
+    static FORCED: Cell<Option<PagedAttentionMode>> = const { Cell::new(None) };
+}
+
+/// Force the mode on *this thread*, overriding `BURN_LM_PAGED_ATTENTION`.
+///
+/// For tests and benchmarks, which need both paths in one binary and cannot get that from an
+/// environment variable read once at startup — and must not mutate the environment of a
+/// multi-threaded process to try.
+///
+/// Per-thread rather than per-process, and that is the whole point. `paged_decode` reads the mode
+/// on the thread that called it, so a test thread's choice reaches exactly its own rounds. A
+/// process-wide switch would instead reach into whatever other tests happened to be running
+/// alongside it — and the tests it would reach into are equivalence suites asserting *byte-exact*
+/// argmax streams between two runs, which a mid-run implementation swap can flip on a near-tie.
+/// That failure would be rare, load-dependent, and blamed on the kernel.
+pub fn force_mode(mode: PagedAttentionMode) {
+    FORCED.with(|forced| forced.set(Some(mode)));
+}
+
 pub(crate) fn mode() -> PagedAttentionMode {
+    if let Some(mode) = FORCED.with(|forced| forced.get()) {
+        return mode;
+    }
     static MODE: OnceLock<PagedAttentionMode> = OnceLock::new();
     *MODE.get_or_init(parse_mode)
 }
