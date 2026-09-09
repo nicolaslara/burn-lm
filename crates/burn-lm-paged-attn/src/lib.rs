@@ -43,7 +43,7 @@ mod oracle;
 mod switch;
 
 pub use oracle::{decode_reference_online, DecodeShape};
-pub use switch::{kernel_launches, PagedAttentionMode};
+pub use switch::{force_mode, kernel_launches, PagedAttentionMode};
 
 use burn::tensor::{DType, Int, Tensor};
 
@@ -100,6 +100,18 @@ pub fn paged_decode(
     }
     if !matches!(q.dtype(), DType::F32 | DType::F16 | DType::BF16) {
         // Quantized pools are out of scope; so is anything exotic.
+        return None;
+    }
+    if k_pool.dtype() != q.dtype() || v_pool.dtype() != q.dtype() {
+        // The kernel is generic over ONE float type and reads all three buffers through it, so a
+        // pool stored at a different width than the query would be reinterpreted rather than
+        // converted — plausible numbers out of the wrong bytes. Nothing in burn-lm produces this
+        // today (the pools and the query both take the device's float dtype), which is exactly why
+        // it has to be refused here rather than assumed away.
+        return None;
+    }
+    if block_table.dtype() != lengths.dtype() {
+        // Same argument, for the integer half: one `I` covers both.
         return None;
     }
     if num_heads != num_kv_heads * n_rep || head_dim != k_head_dim || head_dim == 0 {
