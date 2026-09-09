@@ -178,7 +178,7 @@ mod tests {
     /// store must follow the indices it is handed, nothing else.
     #[test]
     fn test_writes_land_at_ragged_positions_and_blocks_recycle() {
-        let device: Device = Default::default();
+        let device = crate::test_device::test_device();
         // [num_blocks=4 (sentinel + 3), block_size=8, heads=1, head_dim=2]
         let mut store = BlockStore::new(4, 8, 1, 2, &device);
         let t0 = vec![3u32]; // lane 0 -> block 3
@@ -234,7 +234,7 @@ mod tests {
     /// write-address or gather-order bug is caught before attention numerics can hide it.
     #[test]
     fn scripted_writes_reproduce_slab_contents_exactly() {
-        let device: Device = Default::default();
+        let device = crate::test_device::test_device();
         let mut store = BlockStore::new(3, 6, 1, 1, &device);
         let t0 = vec![2u32];
         let t1 = vec![1u32];
@@ -267,7 +267,7 @@ mod tests {
     /// logic left to test, only the arithmetic.
     #[test]
     fn writes_cross_block_boundaries_and_read_back_contiguously() {
-        let device: Device = Default::default();
+        let device = crate::test_device::test_device();
         let mut store = BlockStore::new(5, 4, 1, 1, &device);
         // Deliberately unordered, non-contiguous ids: position i·4.. lives in table[i].
         let table = vec![3u32, 1, 4];
@@ -309,7 +309,7 @@ mod tests {
     /// missing blocks come back as the zeroed sentinel — provably zeros, not another lane's data.
     #[test]
     fn short_lanes_pad_with_the_sentinel_never_a_live_block() {
-        let device: Device = Default::default();
+        let device = crate::test_device::test_device();
         let mut store = BlockStore::new(5, 2, 1, 1, &device);
         let long = vec![1u32, 2]; // positions 0..4
         let short = vec![3u32]; // positions 0..2
@@ -352,7 +352,7 @@ mod tests {
     /// The sentinel block is zeroed at construction and no write may touch it.
     #[test]
     fn sentinel_block_stays_zeroed() {
-        let device: Device = Default::default();
+        let device = crate::test_device::test_device();
         let mut store = BlockStore::new(3, 4, 1, 1, &device);
         write(
             &mut store,
