@@ -15,10 +15,14 @@ default = []
 # out on the very backend it was meant for; `burn_lm_paged_attn::kernel_launches()` is what makes
 # that visible instead of silent.
 kernel = ["burn-lm-paged-attn/kernel"]
+# The three wgpu specializations imply `wgpu` here for the same reason they do in
+# `burn-lm-paged-attn`: they are the same runtime with a compiler pinned at compile time, and the
+# tests need to know that both dispatch variants exist (the f16 grid puts its pools on one of them
+# precisely because the other is already in use — see `src/test_device.rs`).
 wgpu = ["burn-lm-paged-attn/wgpu"]
-metal = ["burn-lm-paged-attn/metal"]
-vulkan = ["burn-lm-paged-attn/vulkan"]
-webgpu = ["burn-lm-paged-attn/webgpu"]
+metal = ["wgpu", "burn-lm-paged-attn/metal"]
+vulkan = ["wgpu", "burn-lm-paged-attn/vulkan"]
+webgpu = ["wgpu", "burn-lm-paged-attn/webgpu"]
 cuda = ["burn-lm-paged-attn/cuda"]
 rocm = ["burn-lm-paged-attn/rocm"]
 

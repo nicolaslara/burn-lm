@@ -12,6 +12,16 @@ version.workspace = true
 license.workspace = true
 readme.workspace = true
 
+[features]
+# Which backend the binary picked, forwarded to the plugins so the paged decode kernel is compiled
+# in for it. The backend itself is selected in `burn-lm-inference`; these only decide whether the
+# kernel exists to be switched on.
+metal = ["burn-lm-llama/metal"]
+wgpu = ["burn-lm-llama/wgpu"]
+vulkan = ["burn-lm-llama/vulkan"]
+cuda = ["burn-lm-llama/cuda"]
+rocm = ["burn-lm-llama/rocm"]
+
 [dependencies]
 burn-lm-inference = { path = "../burn-lm-inference", version = "0.0.1" }
 burn-lm-macros = { path = "../burn-lm-macros", version = "0.0.1" }
