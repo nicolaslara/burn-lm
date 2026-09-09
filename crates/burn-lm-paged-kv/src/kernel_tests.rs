@@ -637,6 +637,122 @@ fn poisoned_padding_cannot_reach_the_kernel_output() {
     );
 }
 
+/// The test the tensor-op reference could not pass until the pool's dead columns became a type.
+///
+/// Same poison, other implementation. The kernel is immune by construction — it never reads past a
+/// length — but the reference gathers whole blocks, and a mask alone cannot save it: a masked
+/// column gets zero attention weight, and the aggregation then computes `0 · V_dead`, which is NaN
+/// whenever `V_dead` is. That is not a hypothetical about hostile input. `BlockStore::new`
+/// allocates with `Tensor::empty`, so on the first use of every block the dead tail past a lane's
+/// length *is* arbitrary bit patterns, and one in a few hundred of those is a NaN. Before
+/// `RaggedKv::neutralized` this failed intermittently on a plain differential run, at 408
+/// non-finite outputs of 544 on the run that pinned it down.
+///
+/// What is asserted is the two halves of the fix: the reference's output is finite, and it is
+/// still the right answer — it agrees with the kernel, which read none of those bytes at all.
+///
+/// Swap the `neutralized` calls in `attention::paged_attention_reference` for
+/// `assume_length_gated` and this fails immediately; that is the check that keeps it honest.
+#[test]
+fn poisoned_dead_columns_cannot_reach_the_reference_output() {
+    // head_dim 17 and block_size 8 leave every lane a dead tail and none of them plane-aligned.
+    let case = Case {
+        block_size: 8,
+        lengths: vec![1, 5, 9, 20],
+        n_rep: 4,
+        head_dim: 17,
+        num_kv_heads: 2,
+    };
+    let dev = f32_device();
+    let Round {
+        mut cache, plan, q, ..
+    } = build_round(&case, &dev, 777);
+    let n_kv = case.num_kv_heads;
+    let d = case.head_dim;
+
+    // Exactly what uninitialized memory is free to contain, written where uninitialized memory
+    // actually sits: the sentinel block that pads every short lane's table, and the dead tail of
+    // each lane's last live block past that lane's own length.
+    let sentinel_rows = Tensor::<4>::from_data(
+        TensorData::new(
+            vec![f32::NAN; case.block_size * n_kv * d],
+            [1, n_kv, case.block_size, d],
+        ),
+        &dev,
+    );
+    for l in cache.layers_mut() {
+        l.write_lanes(
+            &[vec![0u32]],
+            &[0],
+            sentinel_rows.clone(),
+            sentinel_rows.clone(),
+        );
+    }
+    let tables = plan.tables.clone();
+    for (lane, &len) in case.lengths.iter().enumerate() {
+        let tail = case.block_size - (len % case.block_size);
+        if tail == case.block_size {
+            continue; // the lane ends on a block edge; there is no tail
+        }
+        let rows = Tensor::<4>::from_data(
+            TensorData::new(vec![f32::NAN; tail * n_kv * d], [1, n_kv, tail, d]),
+            &dev,
+        );
+        for l in cache.layers_mut() {
+            l.write_lanes(
+                std::slice::from_ref(&tables[lane]),
+                &[len],
+                rows.clone(),
+                rows.clone(),
+            );
+        }
+    }
+
+    // Non-vacuity: the NaN has to be in the pool for its absence from the output to mean anything.
+    {
+        let (k_pool, v_pool) = layer(&mut cache).pools();
+        let poisoned_cells = k_pool
+            .assume_length_gated()
+            .into_data()
+            .iter::<f32>()
+            .chain(v_pool.assume_length_gated().into_data().iter::<f32>())
+            .filter(|x: &f32| !x.is_finite())
+            .count();
+        assert!(
+            poisoned_cells > 0,
+            "the NaN never reached the pools, so this test proves nothing"
+        );
+    }
+
+    force_mode(PagedAttentionMode::Kernel);
+    let launches_before = kernel_launches();
+    let out_kernel = {
+        let l = cache.layers_mut().next().unwrap();
+        host(paged_attention(q.clone(), l, &plan, case.n_rep))
+    };
+    assert!(kernel_launches() > launches_before, "the kernel never ran");
+
+    let out_ref = {
+        let l = cache.layers_mut().next().unwrap();
+        host(paged_attention_reference(q, l, &plan, case.n_rep))
+    };
+    let non_finite = out_ref.iter().filter(|x| !x.is_finite()).count();
+    assert_eq!(
+        non_finite,
+        0,
+        "{non_finite} of {} reference outputs are non-finite: the gathered scratch's dead columns \
+         reached the value aggregation, where `0 · NaN` is NaN however well the score was masked",
+        out_ref.len()
+    );
+
+    // ...and it is still the right answer, not merely a finite one.
+    let (lane, diff) = worst_lane_diff(&out_ref, &out_kernel, case.n());
+    assert!(
+        diff < 1.0e-5,
+        "reference vs kernel under poison: lane {lane} -> {diff:e}"
+    );
+}
+
 /// A lane at `len == 1`, the shortest possible decode: `alpha` is exactly 0 on the only iteration,
 /// `l` ends at exactly 1.0, and the output is exactly that key's value row. Checked against the
 /// stored V directly rather than against another implementation, because the answer is known.
