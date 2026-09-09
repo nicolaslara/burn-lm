@@ -14,6 +14,11 @@
 //! So it stays, verbatim, and it stays correct. That is the permanent cost of having two paths —
 //! and also the property that lets the kernel be deleted in one commit if its number disappoints.
 //!
+//! The two paths part company on one more thing, and it is not performance. The KV pool is
+//! allocated uninitialized, so the reference's gathered scratch carries columns nobody ever wrote;
+//! it neutralizes them before attending, while the kernel simply never reads them. `RaggedKv` is
+//! the type that makes each path say which it is doing.
+//!
 //! Nothing outside this module may assume the reference's scratch (or any other intermediate)
 //! exists; a round that took the kernel never materializes one.
 
@@ -59,10 +64,18 @@ pub fn paged_attention(
             // not `is_causal` — the length walk is the mask, and a single query position at the
             // end of its own history has nothing causal left to hide.
             let scale = (1.0 / (head_dim as f64).sqrt()) as f32;
+            //
+            // `assume_length_gated` is the kernel's assertion about the pool's uninitialized
+            // memory, and it is the one consumer entitled to make it: its block walk's inner
+            // bound IS the length. For block `b` of a lane it processes exactly
+            // `min(block_size, len - b·block_size)` positions and stops, and it visits only the
+            // blocks in that lane's own table, so it never loads an element the round did not
+            // write. Nothing is being claimed about the *contents* of the dead tails — only that
+            // they are not read. See `RaggedKv`.
             burn_lm_paged_attn::paged_decode(
                 q.clone(),
-                k_pool,
-                v_pool,
+                k_pool.assume_length_gated(),
+                v_pool.assume_length_gated(),
                 plan.gather_idx.clone(),
                 plan.lengths.clone(),
                 n_rep,
@@ -92,8 +105,15 @@ pub fn paged_attention_reference(
 ) -> Tensor<4> {
     let [n, num_heads, seq_len, _] = q.dims();
     let (k, v) = cache.gather(plan);
-    let k = repeat_kv(k, n_rep);
-    let v = repeat_kv(v, n_rep);
+    // The gather returns WHOLE blocks, so every column past a lane's own length is memory nobody
+    // ever wrote — and the mask below cannot save this path from it. A masked column gets zero
+    // attention weight, and the aggregation then computes `0 · V_dead`, which is NaN whenever the
+    // uninitialized bytes happened to spell one. Zeroing the dead columns first is what makes the
+    // mask sufficient again. It happens before `repeat_kv` deliberately: `n_rep` copies of a
+    // neutralized head cost the same as one, and neutralizing after the expansion would cost
+    // `n_rep` times as much. See `RaggedKv`.
+    let k = repeat_kv(k.neutralized(plan), n_rep);
+    let v = repeat_kv(v.neutralized(plan), n_rep);
     let mask = mask_over_heads(plan.mask.clone(), num_heads);
     // The mask is the one operand the attention op reads by shape rather than by content, so a
     // disagreement with q/k here is silent corruption rather than a panic: the fused kernel takes
