@@ -120,8 +120,10 @@ impl<T: Tokenizer + 'static> Llama<T> {
         // sequence in the same round it is produced, so no token is generated past it.
         let mut failure = None;
         'rounds: while active.iter().any(|seq| !seq.finished) {
-            // A fresh prefill budget per round over the whole batch.
-            let mut budget = PrefillBudget::for_round(&active);
+            // A fresh prefill budget per round over the whole batch. Unbounded (`0`), matching the
+            // unbounded chunk width below: this driver takes a fixed batch and no new prompt ever
+            // arrives mid-run, so there is no burst to pace — the whole batch prefills up front.
+            let mut budget = PrefillBudget::for_round(&active, 0);
             // The sampler carries no per-sequence state — greedy argmax draws nothing, and a
             // stochastic strategy draws from the backend RNG — so the whole round samples through the
             // one shared `sampler`, the same shape the serving worker uses.
