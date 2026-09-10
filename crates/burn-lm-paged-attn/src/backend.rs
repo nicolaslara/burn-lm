@@ -155,10 +155,18 @@ pub(crate) fn device_supports(
 /// lanes — and it reaches about 300 GB/s of roughly 400 GB/s of hardware bandwidth. There is no
 /// corner of the grid where it loses, which is what a default needs.
 ///
-/// **Everywhere else: no.** On CUDA the reference is genuinely good: burn's fused attention has a
-/// real flash-attention kernel behind it there, and the margin is small enough that it should be
-/// measured on the device in question before it becomes a default. Those backends keep the
-/// reference unless asked, and `BURN_LM_PAGED_ATTENTION=kernel` is how you ask.
+/// **Everywhere else: not yet, and CUDA is the interesting case.** An A10G at fp16 serving
+/// Llama-3.2-1B at width 16 measured 21.6 / 21.2 / 25.5 ms per decode round at l_max ~100 / ~1000
+/// / ~4000 with the kernel, against 30.0 / 52.9 / ~177 ms with the reference — a win at every
+/// context length, and at 4000 tokens the reference could not finish the burst at all. So CUDA is
+/// not staying opt-in because the kernel is slow there. It is staying opt-in because that is one
+/// GPU generation (sm86). sm90 was measured only against the *previous*, unoptimized kernel, where
+/// it came out flat, and the change that produced these numbers — splitting a lane's walk across
+/// the planes of a cube — is exactly the kind of change whose payoff depends on how many warps the
+/// device wanted in the first place. Re-measure an H100 and this becomes a two-line change.
+///
+/// `BURN_LM_PAGED_ATTENTION=kernel` is how you ask for it in the meantime, and on CUDA today you
+/// should.
 pub(crate) fn device_defaults_to_kernel(device: &Device) -> bool {
     #[allow(unused_imports)]
     use burn::backend::DispatchDevice;
