@@ -1,19 +1,19 @@
-//! The kernel: one plane per `(lane, kv_head)`, walking that lane's block table in place.
+//! The kernel: planes that walk a lane's block table in place, reading the pool a vector at a time.
 //!
 //! # Why this decomposition
 //!
-//! A plane owns exactly one lane, so `lengths[lane]` — and therefore the block count and every
-//! per-block bound derived from it — is *plane-uniform by construction*. That single property is
-//! what the whole shape buys: no loop bound and no predicate in the walk ever differs across the
-//! plane, so no plane reduction ever sits under divergent control flow. Which in turn means no
-//! shared memory, no `sync_cube`, no `sync_plane`, no idle-unit sentinel dance, and no dependency
-//! on `Plane::NonUniformControlFlow`. The kernel needs `Plane::Ops` and nothing else.
+//! A plane owns exactly one `(lane, kv_head)`, so `lengths[lane]` — and therefore the block count
+//! and every per-block bound derived from it — is *plane-uniform by construction*. That single
+//! property is what the whole shape buys: no loop bound and no predicate in the walk ever differs
+//! across the plane, so no plane reduction ever sits under divergent control flow. The kernel
+//! needs `Plane::Ops` and nothing else, and inside the walk there is no barrier at all.
 //!
-//! Within a plane, a unit owns a *cyclic* slice of `head_dim`: `d = u + i·plane_dim`. Cyclic, not
-//! blocked, because at a fixed `i` the plane's units then read `plane_dim` consecutive elements —
-//! one coalesced transaction per load instead of one per unit — and the output store coalesces for
-//! the same reason. The unit also owns its own slice of all `n_rep` accumulators, so the epilogue
-//! has no cross-unit reduction at all: each unit divides its own values and stores them.
+//! Within a plane, a unit owns a *cyclic* slice of the row: slot `j = u + i·plane_dim`, where a
+//! slot is `vector_width` consecutive elements. Cyclic, not blocked, because at a fixed `i` the
+//! plane's units then cover `plane_dim · vector_width` consecutive elements — one coalesced
+//! transaction per load — and the output store coalesces for the same reason. The unit also owns
+//! its own slice of all `n_rep` accumulators, so a single-plane cube has no cross-unit reduction
+//! in its epilogue at all: each unit divides its own values and stores them.
 //!
 //! Grouped-query attention is structural rather than a special case: K and V are read once per key
 //! position and serve all `n_rep` query heads out of registers. There is no code path where the
@@ -27,22 +27,41 @@
 //! `n · l_max`, a table walk costs `Σ_j len_j`. It also means the sentinel-padded tail of the block
 //! table and the dead tail of a lane's last live block are *never read*, which is what retires the
 //! mask instead of reimplementing it.
-
+//!
 //! # Why a cube may hold several planes
 //!
 //! One plane per `(lane, kv_head)` is the whole grid, and at serving widths that grid is tiny: a
-//! batch of 16 over 8 KV heads is 128 planes for an entire GPU. An A10G wants thousands. So a cube
+//! batch of 16 over 8 KV heads is 128 planes for an entire GPU. An A10G wants thousands, and with
+//! only 128 it spends the round waiting on memory latency it has nothing to hide behind. So a cube
 //! may hold `planes` planes, and they split the *block walk* between them cyclically — plane `p`
-//! takes blocks `p, p+planes, p+2·planes, …`. Every plane still owns a whole block, so `live` and
+//! takes blocks `p, p+planes, p+2·planes, …`. Every plane still owns whole blocks, so `live` and
 //! the loop bound stay plane-uniform and no plane reduction lands under divergent control flow;
 //! what differs across planes is only how many trips each makes, and nothing inside the walk is
 //! cube-wide.
 //!
 //! Each plane finishes with its own online-softmax state over its own subset of the keys, so the
 //! epilogue merges them: `m` is the max over planes, and each plane's `l` and `acc` are rescaled by
-//! `exp(m_p − m)` before being summed. That is one `sync_cube` for the whole kernel, at the end,
-//! and it is why the split is *within* a cube — merging partial softmax states across cubes would
+//! `exp(m_p − m)` before being summed. That is one `sync_cube` for the whole kernel, at the very
+//! end, and it is why the split is *within* a cube — merging partial states across cubes would
 //! need a second pass over device memory, and this needs none.
+//!
+//! # Why there is no shared-memory K/V tile
+//!
+//! Because there is nothing to reuse. Staging a block's K and V into `Shared` pays off when many
+//! units read the same element, and here no element is read twice by anybody: within a plane, key
+//! position `t`'s slot `j` is read by exactly one unit, and the planes of a cube walk *disjoint*
+//! blocks, so they do not share a key either. A tile would add a shared write, a barrier and a
+//! shared read per element and remove no global traffic at all. The access it would supposedly
+//! fix is already ideal — at a fixed key the plane's units cover `plane_dim · vector_width`
+//! consecutive elements, which is one or two full transactions and nothing wasted.
+//!
+//! # Why the loads are vectorized
+//!
+//! Every buffer is read along `head_dim`, which is contiguous, so a unit can move
+//! `vector_width` elements per instruction instead of one. The width is chosen on the host from
+//! the device's own optimal load width, capped so that a row still has at least `plane_dim` slots:
+//! a wider vector that left half the plane with nothing to load would trade instruction count for
+//! idle units and a plane reduction over dead lanes. See [`vector_width`].
 
 use burn::backend::cubecl::dtype_to_storage_type;
 use burn::backend::{Shape, TensorMetadata};
@@ -54,59 +73,75 @@ use cubecl::client::ComputeClient;
 use cubecl::features::Plane;
 use cubecl::prelude::*;
 
-/// Load one element of a head row, with the ragged-`head_dim` tail folded to an exact zero.
+/// Load one slot of a head row, with the ragged tail folded to an exact zero.
 ///
-/// `head_dim` need not be a multiple of `plane_dim` (80 and 96 are real head dims), so the last
-/// unrolled step can address past the row. Both the index and the value are chosen with `select`
-/// rather than a branch: the read always lands inside the row it belongs to, the out-of-range lanes
-/// contribute an exact `0.0` to the dot product, and — the point — no `plane_sum` ever ends up
-/// under a predicate.
+/// A row is `slots` slots long and `slots` need not be a multiple of `plane_dim` (head_dim 80 is a
+/// real head dim), so the last unrolled step can address past the row. Both the index and the
+/// value are chosen without a branch: the read always lands inside the row it belongs to — slot 0,
+/// which every live row has and every live row wrote — and the out-of-range lanes contribute an
+/// exact `0.0` to the dot product. Which is the point: no `plane_sum` ever ends up under a
+/// predicate, and no poisoned or uninitialized element is ever the thing being zeroed.
 #[cube]
-fn read_masked<E: Float>(
-    tensor: &Tensor<E>,
+fn read_masked<E: Float, N: Size>(
+    tensor: &Tensor<Vector<E, N>>,
     base: usize,
-    d: usize,
-    #[comptime] head_dim: usize,
-) -> f32 {
-    let live = d < head_dim;
-    let idx = select(live, d, 0);
-    select(live, f32::cast_from(tensor[base + idx]), f32::new(0.0))
+    slot: usize,
+    #[comptime] slots: usize,
+) -> Vector<f32, N> {
+    let live = slot < slots;
+    let idx = select(live, slot, 0);
+    let value = Vector::<f32, N>::cast_from(tensor[base + idx]);
+    value * Vector::new(select(live, f32::new(1.0), f32::new(0.0)))
+}
+
+/// Sum a vector's own elements. One per query head per key, on a register.
+#[cube]
+fn horizontal_sum<N: Size>(v: Vector<f32, N>) -> f32 {
+    let mut total = f32::new(0.0);
+    #[unroll]
+    for k in 0..N::value() {
+        total += v.extract(k);
+    }
+    total
 }
 
 /// Paged attention, decode only (`seq_q == 1`).
 ///
 /// Every buffer is contiguous by precondition (asserted on the host), so offsets are built from
 /// shapes and never by dividing strides. That is deliberate: stride arithmetic under a vectorized
-/// or reshaped view is the one bug class here that corrupts silently rather than panicking.
+/// or reshaped view is the one bug class here that corrupts silently rather than panicking. The
+/// offsets below are in *slots*, and every row base is a multiple of `head_dim`, which the host
+/// guarantees is a multiple of the vector width — so no row ever starts mid-vector.
 ///
 /// Accumulation is f32 whatever the storage dtype `E` is.
 #[cube(launch, address_type = "dynamic")]
 #[allow(clippy::too_many_arguments)]
-fn paged_decode_kernel<E: Float, I: Int>(
-    q: &Tensor<E>,           // [n, num_heads, 1, head_dim]
-    k_pool: &Tensor<E>,      // [num_blocks, block_size, num_kv_heads, head_dim]
-    v_pool: &Tensor<E>,      // same shape as k_pool
-    block_table: &Tensor<I>, // [n * blocks_per_lane]
-    lengths: &Tensor<I>,     // [n]
-    out: &mut Tensor<E>,     // [n, num_heads, 1, head_dim]
+fn paged_decode_kernel<E: Float, I: Int, N: Size>(
+    q: &Tensor<Vector<E, N>>,       // [n, num_heads, 1, head_dim]
+    k_pool: &Tensor<Vector<E, N>>,  // [num_blocks, block_size, num_kv_heads, head_dim]
+    v_pool: &Tensor<Vector<E, N>>,  // same shape as k_pool
+    block_table: &Tensor<I>,        // [n * blocks_per_lane]
+    lengths: &Tensor<I>,            // [n]
+    out: &mut Tensor<Vector<E, N>>, // [n, num_heads, 1, head_dim]
     scale: f32,
     block_size: u32,
     blocks_per_lane: u32,
     num_kv_heads: u32,
-    #[comptime] head_dim: usize,
+    #[comptime] slots: usize, // head_dim / vector_width
     #[comptime] plane_dim: usize,
-    #[comptime] dpu: usize, // ceil(head_dim / plane_dim)
+    #[comptime] dpu: usize,    // ceil(slots / plane_dim)
     #[comptime] planes: usize, // planes per cube, each taking every `planes`-th block
     #[comptime] n_rep: usize,
     #[define(E, I)] _dtypes: [ElemType; 2],
 ) {
-    // Who am I. `cube_count` is exactly the number of working planes, so there is no range guard
-    // and no `terminate!()`: every launched unit has real work.
+    // Who am I. `cube_count` is exactly the number of working cubes, so there is no range guard
+    // and no `terminate!()`: every launched unit has real work (or, for a plane that drew no
+    // blocks, a merge contribution the epilogue is built to absorb).
     let lane = CUBE_POS_Y as usize;
     let kv_head = CUBE_POS_X as usize;
     let u = UNIT_POS_X as usize;
-    // `CubeDim.x` is exactly `plane_dim`, so the cube's y index and its plane index are the same
-    // number. The launch asserts that; the whole merge below depends on it.
+    // `CubeDim.x` is exactly `plane_dim`, so a unit's y index *is* its plane index. The launch
+    // builds the cube dim that way and the block split below depends on it.
     let p = UNIT_POS_Y as usize;
     let bs = block_size as usize;
     let bpl = blocks_per_lane as usize;
@@ -120,23 +155,23 @@ fn paged_decode_kernel<E: Float, I: Int>(
 
     // Per-unit register state. Zeroed explicitly — `Array::new` does allocate with a zero
     // attribute, but cubek's own kernels do not rely on it and neither does this one.
-    let mut qv = Array::<f32>::new(n_rep * dpu);
-    let mut acc = Array::<f32>::new(n_rep * dpu);
+    let mut qv = Array::<Vector<f32, N>>::new(n_rep * dpu);
+    let mut acc = Array::<Vector<f32, N>>::new(n_rep * dpu);
     let mut m = Array::<f32>::new(n_rep);
     let mut l = Array::<f32>::new(n_rep);
-    let mut kv = Array::<f32>::new(dpu);
-    let mut vv = Array::<f32>::new(dpu);
+    let mut kv = Array::<Vector<f32, N>>::new(dpu);
+    let mut vv = Array::<Vector<f32, N>>::new(dpu);
     let mut s = Array::<f32>::new(n_rep);
 
     #[unroll]
     for g in 0..n_rep {
         let head = kv_head * n_rep + g;
-        let qbase = (lane * num_heads + head) * head_dim;
+        let qbase = (lane * num_heads + head) * slots;
         #[unroll]
         for i in 0..dpu {
-            let d = u + i * plane_dim;
-            qv[g * dpu + i] = read_masked::<E>(q, qbase, d, head_dim);
-            acc[g * dpu + i] = f32::new(0.0);
+            let slot = u + i * plane_dim;
+            qv[g * dpu + i] = read_masked::<E, N>(q, qbase, slot, slots);
+            acc[g * dpu + i] = Vector::new(f32::new(0.0));
         }
         // Finite sentinel, not -inf: `exp(sentinel - s)` is exactly 0, while `-inf` minus `-inf`
         // would be NaN and WGSL rejects an infinity literal.
@@ -156,30 +191,36 @@ fn paged_decode_kernel<E: Float, I: Int>(
         let live = min(bs, remaining);
 
         for t in 0..live {
-            let row = ((base + t) * kvh + kv_head) * head_dim;
+            let row = ((base + t) * kvh + kv_head) * slots;
 
             // K read ONCE, serving all `n_rep` query heads.
             #[unroll]
             for i in 0..dpu {
-                let d = u + i * plane_dim;
-                kv[i] = read_masked::<E>(k_pool, row, d, head_dim);
+                let slot = u + i * plane_dim;
+                kv[i] = read_masked::<E, N>(k_pool, row, slot, slots);
             }
-            // One plane reduction per query head per key. `s[g]` comes back plane-uniform.
+            // One plane reduction per query head per key. The per-unit part is accumulated as a
+            // vector and flattened once, so the vector width costs no extra plane traffic.
+            // `s[g]` comes back plane-uniform.
             #[unroll]
             for g in 0..n_rep {
-                let mut part = f32::new(0.0);
+                let mut part = Vector::<f32, N>::new(f32::new(0.0));
                 #[unroll]
                 for i in 0..dpu {
                     part += qv[g * dpu + i] * kv[i];
                 }
-                s[g] = plane_sum(part) * scale;
+                s[g] = plane_sum(horizontal_sum::<N>(part)) * scale;
             }
 
-            // V read ONCE.
+            // V read ONCE. Hoisting this above the plane reductions — so the two loads issue
+            // back to back and the reduction chain hides both latencies — was tried and measured
+            // as exactly no change on Metal: at 320 GB/s of roughly 400 the walk is bandwidth
+            // bound, not latency bound, and the planes-per-cube split already gives the scheduler
+            // plenty of other warps to run. Left in algorithm order.
             #[unroll]
             for i in 0..dpu {
-                let d = u + i * plane_dim;
-                vv[i] = read_masked::<E>(v_pool, row, d, head_dim);
+                let slot = u + i * plane_dim;
+                vv[i] = read_masked::<E, N>(v_pool, row, slot, slots);
             }
 
             // Online softmax. `l` and `acc` are rescaled by the same alpha and take the same p, so
@@ -189,11 +230,13 @@ fn paged_decode_kernel<E: Float, I: Int>(
             for g in 0..n_rep {
                 let m_new = max(m[g], s[g]);
                 let alpha = (m[g] - m_new).exp();
-                let p = (s[g] - m_new).exp();
-                l[g] = l[g] * alpha + p;
+                let weight = (s[g] - m_new).exp();
+                l[g] = l[g] * alpha + weight;
+                let alpha_v = Vector::<f32, N>::new(alpha);
+                let weight_v = Vector::<f32, N>::new(weight);
                 #[unroll]
                 for i in 0..dpu {
-                    acc[g * dpu + i] = acc[g * dpu + i] * alpha + p * vv[i];
+                    acc[g * dpu + i] = acc[g * dpu + i] * alpha_v + weight_v * vv[i];
                 }
                 m[g] = m_new;
             }
@@ -208,13 +251,13 @@ fn paged_decode_kernel<E: Float, I: Int>(
         #[unroll]
         for g in 0..n_rep {
             let head = kv_head * n_rep + g;
-            let obase = (lane * num_heads + head) * head_dim;
-            let inv = f32::new(1.0) / max(l[g], f32::new(1.0e-30));
+            let obase = (lane * num_heads + head) * slots;
+            let inv = Vector::<f32, N>::new(f32::new(1.0) / max(l[g], f32::new(1.0e-30)));
             #[unroll]
             for i in 0..dpu {
-                let d = u + i * plane_dim;
-                if d < head_dim {
-                    out[obase + d] = E::cast_from(acc[g * dpu + i] * inv);
+                let slot = u + i * plane_dim;
+                if slot < slots {
+                    out[obase + slot] = Vector::<E, N>::cast_from(acc[g * dpu + i] * inv);
                 }
             }
         }
@@ -230,7 +273,7 @@ fn paged_decode_kernel<E: Float, I: Int>(
         // because a decode lane always holds at least one position.
         let mut part_m = Shared::<[f32]>::new_slice(planes * n_rep);
         let mut part_l = Shared::<[f32]>::new_slice(planes * n_rep);
-        let mut part_acc = Shared::<[f32]>::new_slice(planes * n_rep * dpu * plane_dim);
+        let mut part_acc = Shared::<[Vector<f32, N>]>::new_slice(planes * n_rep * dpu * plane_dim);
 
         #[unroll]
         for g in 0..n_rep {
@@ -254,38 +297,64 @@ fn paged_decode_kernel<E: Float, I: Int>(
             for g in 0..n_rep {
                 let mut m_all = part_m[g];
                 #[unroll]
-                for q_plane in 1..planes {
-                    m_all = max(m_all, part_m[q_plane * n_rep + g]);
+                for other in 1..planes {
+                    m_all = max(m_all, part_m[other * n_rep + g]);
                 }
                 let mut l_all = f32::new(0.0);
-                let mut acc_all = Array::<f32>::new(dpu);
+                let mut acc_all = Array::<Vector<f32, N>>::new(dpu);
                 #[unroll]
                 for i in 0..dpu {
-                    acc_all[i] = f32::new(0.0);
+                    acc_all[i] = Vector::new(f32::new(0.0));
                 }
                 #[unroll]
-                for q_plane in 0..planes {
-                    let alpha = (part_m[q_plane * n_rep + g] - m_all).exp();
-                    l_all += part_l[q_plane * n_rep + g] * alpha;
+                for other in 0..planes {
+                    let alpha = (part_m[other * n_rep + g] - m_all).exp();
+                    l_all += part_l[other * n_rep + g] * alpha;
+                    let alpha_v = Vector::<f32, N>::new(alpha);
                     #[unroll]
                     for i in 0..dpu {
                         acc_all[i] +=
-                            part_acc[((q_plane * n_rep + g) * dpu + i) * plane_dim + u] * alpha;
+                            part_acc[((other * n_rep + g) * dpu + i) * plane_dim + u] * alpha_v;
                     }
                 }
                 let head = kv_head * n_rep + g;
-                let obase = (lane * num_heads + head) * head_dim;
-                let inv = f32::new(1.0) / max(l_all, f32::new(1.0e-30));
+                let obase = (lane * num_heads + head) * slots;
+                let inv = Vector::<f32, N>::new(f32::new(1.0) / max(l_all, f32::new(1.0e-30)));
                 #[unroll]
                 for i in 0..dpu {
-                    let d = u + i * plane_dim;
-                    if d < head_dim {
-                        out[obase + d] = E::cast_from(acc_all[i] * inv);
+                    let slot = u + i * plane_dim;
+                    if slot < slots {
+                        out[obase + slot] = Vector::<E, N>::cast_from(acc_all[i] * inv);
                     }
                 }
             }
         }
     }
+}
+
+/// How many elements one unit moves per load.
+///
+/// Two constraints, and they pull against each other. The device wants its full load width used —
+/// `io_optimized_vector_sizes` is cubecl's own answer for that, derived from `load_width` and the
+/// element size, so 4 for f32 and 8 for f16 on CUDA. The kernel wants a row to keep at least
+/// `plane_dim` slots, because slots are what the plane's units divide between them: at head_dim 64
+/// on a 32-wide plane, a width of 4 would leave half the plane with nothing to load while the
+/// `plane_sum` still ran over all 32 lanes. So the width is the largest optimal size that both
+/// divides `head_dim` and leaves `head_dim / width >= plane_dim`.
+///
+/// The divisibility is not a nicety: every row base in the kernel is a multiple of `head_dim`, and
+/// that is the whole reason a slot index can be a row base divided by the width without a row ever
+/// starting mid-vector.
+fn vector_width<R: CubeRuntime>(
+    client: &ComputeClient<R>,
+    elem_size: usize,
+    head_dim: usize,
+    plane_dim: usize,
+) -> usize {
+    client
+        .io_optimized_vector_sizes(elem_size)
+        .find(|&width| width <= head_dim / plane_dim.max(1) && head_dim.is_multiple_of(width))
+        .unwrap_or(1)
 }
 
 /// How many planes one cube should hold, given how few cubes the grid has.
@@ -305,6 +374,7 @@ fn paged_decode_kernel<E: Float, I: Int>(
 /// - **shared memory**: the merge scratch has to fit;
 /// - **diminishing returns**: past 32 planes a cube is a whole SM's worth of warps waiting on one
 ///   barrier, and the unrolled merge stops being free.
+#[allow(clippy::too_many_arguments)]
 fn planes_per_cube<R: CubeRuntime>(
     client: &ComputeClient<R>,
     n: usize,
@@ -313,6 +383,7 @@ fn planes_per_cube<R: CubeRuntime>(
     n_rep: usize,
     dpu: usize,
     plane_dim: usize,
+    vector_width: usize,
 ) -> usize {
     let hw = &client.properties().hardware;
 
@@ -330,8 +401,9 @@ fn planes_per_cube<R: CubeRuntime>(
     let by_work = blocks_per_lane.max(1);
     let by_units = (hw.max_units_per_cube as usize / plane_dim).max(1);
     let by_cube_dim = (hw.max_cube_dim.1 as usize).max(1);
-    // Two `[planes * n_rep]` f32 arrays plus one `[planes * n_rep * dpu * plane_dim]` one.
-    let floats_per_plane = n_rep * dpu * plane_dim + 2 * n_rep;
+    // Two `[planes * n_rep]` f32 arrays plus one `[planes * n_rep * dpu * plane_dim]` array of
+    // f32 vectors.
+    let floats_per_plane = n_rep * dpu * plane_dim * vector_width + 2 * n_rep;
     let by_shared = (hw.max_shared_memory_size / (floats_per_plane * 4)).max(1);
 
     let cap = wanted
@@ -364,10 +436,10 @@ pub(crate) fn supported<R: CubeRuntime>(
     if !props.features.plane.contains(Plane::Ops) {
         return false;
     }
-    // The kernel's whole geometry is "one plane per cube, `plane_dim` units wide", so it has to
-    // know the plane size. On wgpu-over-AMD the value is a range, and on Intel it depends on the
-    // kernel's own register use; neither is queryable here. Those devices take the reference path
-    // and stay correct.
+    // The kernel's whole geometry is "planes of `plane_dim` units", so it has to know the plane
+    // size. On wgpu-over-AMD the value is a range, and on Intel it depends on the kernel's own
+    // register use; neither is queryable here. Those devices take the reference path and stay
+    // correct.
     if hw.plane_size_min != hw.plane_size_max {
         return false;
     }
@@ -438,7 +510,9 @@ pub(crate) fn launch<R: CubeRuntime>(
     }
 
     let plane_dim = client.properties().hardware.plane_size_max as usize;
-    let dpu = head_dim.div_ceil(plane_dim);
+    let width = vector_width::<R>(&client, q.dtype.size(), head_dim, plane_dim);
+    let slots = head_dim / width;
+    let dpu = slots.div_ceil(plane_dim);
     let blocks_per_lane = table_len / n;
     let planes = planes_per_cube::<R>(
         &client,
@@ -448,6 +522,7 @@ pub(crate) fn launch<R: CubeRuntime>(
         n_rep,
         dpu,
         plane_dim,
+        width,
     );
 
     // `q` arrives from a `swap_dims` in the model, so make it contiguous — it is small
@@ -488,6 +563,7 @@ pub(crate) fn launch<R: CubeRuntime>(
         // the runtime which plane it is in.
         CubeDim::new_2d(plane_dim as u32, planes as u32),
         address_type,
+        width,
         q.into_tensor_arg(),
         k_pool.into_tensor_arg(),
         v_pool.into_tensor_arg(),
@@ -498,7 +574,7 @@ pub(crate) fn launch<R: CubeRuntime>(
         block_size as u32,
         blocks_per_lane as u32,
         num_kv_heads as u32,
-        head_dim,
+        slots,
         plane_dim,
         dpu,
         planes,
