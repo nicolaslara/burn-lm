@@ -78,10 +78,7 @@ pub(crate) fn count_launch() {
     // between the env switch and the GPU said yes. After that, a decade-spaced heartbeat keeps the
     // count visible in a long benchmark without writing a line per decode round.
     if previous == 0 || (previous + 1) % 10_000 == 0 {
-        log::info!(
-            "burn-lm paged decode: kernel launches = {}",
-            previous + 1
-        );
+        log::info!("burn-lm paged decode: kernel launches = {}", previous + 1);
     }
 }
 

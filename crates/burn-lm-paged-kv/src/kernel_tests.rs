@@ -1307,8 +1307,8 @@ fn bench_paged_decode_against_the_reference() {
     let dev = f32_device();
     let (num_kv_heads, n_rep, head_dim, block_size) = (8usize, 4usize, 64usize, 128usize);
     let num_heads = num_kv_heads * n_rep;
-    let rounds = 10;
-    let warmup = 3;
+    let rounds = 5;
+    let warmup = 2;
     // Launches enqueued per host sync. A single-round readback on this geometry is dominated by
     // submit + readback latency (several milliseconds of it), which hides whatever the kernel
     // itself costs; batching the launches behind one sync amortizes that to where the number
@@ -1370,12 +1370,15 @@ fn bench_paged_decode_against_the_reference() {
 
             let mut time = |mode: PagedAttentionMode| {
                 force_mode(mode);
-                let mut start = std::time::Instant::now();
+                // The best round, not the average. A laptop GPU shares its power budget with
+                // everything else on the machine, and over a few minutes of benchmarking the mean
+                // drifts by more than the differences being measured. The minimum is the
+                // question actually being asked — how fast does this run when nothing is in its
+                // way — and it is the only statistic here that is stable enough to compare two
+                // kernels by.
+                let mut best = f64::INFINITY;
                 for round in 0..rounds + warmup {
-                    if round == warmup {
-                        // Untimed warmup absorbs shader compilation and autotune.
-                        start = std::time::Instant::now();
-                    }
+                    let start = std::time::Instant::now();
                     let l = cache.layers_mut().next().unwrap();
                     let mut last = None;
                     for _ in 0..inner {
@@ -1383,8 +1386,13 @@ fn bench_paged_decode_against_the_reference() {
                     }
                     // The readback is the sync: without it this would time enqueueing.
                     let _ = host(last.unwrap());
+                    // The warmup rounds absorb shader compilation and autotune; they are timed
+                    // and thrown away rather than untimed, so the loop has one shape.
+                    if round >= warmup {
+                        best = best.min(start.elapsed().as_secs_f64() * 1e3 / inner as f64);
+                    }
                 }
-                start.elapsed().as_secs_f64() * 1e3 / (rounds * inner) as f64
+                best
             };
 
             let launches_before = kernel_launches();
