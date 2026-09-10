@@ -145,6 +145,33 @@ pub(crate) fn device_supports(
     supported
 }
 
+/// Whether this device runs the kernel when nobody asked for either implementation.
+///
+/// `BURN_LM_PAGED_ATTENTION` unset means "use whichever is faster here", and the honest answer
+/// differs by backend, so it is answered per device rather than by one global default.
+///
+/// **Metal: yes.** On an M1 Max the kernel beats the tensor-op reference everywhere the roofline
+/// bench looks — from 1.2x at the shortest context and one lane to 20x at 4096 tokens across 32
+/// lanes — and it reaches about 300 GB/s of roughly 400 GB/s of hardware bandwidth. There is no
+/// corner of the grid where it loses, which is what a default needs.
+///
+/// **Everywhere else: no.** On CUDA the reference is genuinely good: burn's fused attention has a
+/// real flash-attention kernel behind it there, and the margin is small enough that it should be
+/// measured on the device in question before it becomes a default. Those backends keep the
+/// reference unless asked, and `BURN_LM_PAGED_ATTENTION=kernel` is how you ask.
+pub(crate) fn device_defaults_to_kernel(device: &Device) -> bool {
+    #[allow(unused_imports)]
+    use burn::backend::DispatchDevice;
+
+    #[cfg(feature = "metal")]
+    if matches!(device.as_dispatch(), DispatchDevice::Metal(_)) {
+        return true;
+    }
+
+    let _ = device;
+    false
+}
+
 /// The fusion implementation — the one that actually runs.
 ///
 /// `burn::backend::Wgpu` is `Fusion<CubeBackend<WgpuRuntime>>`, so a burn-lm tensor never reaches

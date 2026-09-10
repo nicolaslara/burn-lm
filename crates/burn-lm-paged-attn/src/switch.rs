@@ -8,34 +8,41 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PagedAttentionMode {
     /// Generic tensor ops: gather, transpose, expand, fused attention under the plan's mask. The
-    /// default, and the oracle every kernel test compares against.
+    /// oracle every kernel test compares against, and the implementation for everything the
+    /// kernel does not serve.
     Reference,
     /// The paged decode kernel, where it applies; the reference everywhere else.
     Kernel,
+    /// Let the device decide. The default, and the only mode whose answer depends on where the
+    /// tensors live — see `crate::backend::device_defaults_to_kernel`.
+    Auto,
 }
 
-/// `BURN_LM_PAGED_ATTENTION` — `kernel` or `reference`, read once.
+/// `BURN_LM_PAGED_ATTENTION` — `kernel`, `reference` or `auto`, read once.
 ///
-/// The default is `reference` on purpose. `OperationIr::Custom` is a fusion barrier, so the kernel
-/// costs whatever elementwise fusion currently wraps the attention chain; at short context that can
-/// be more than the copies it removes. Until there is a number saying otherwise, the kernel is
-/// something you ask for.
+/// The default is `auto`, which asks the device. It used to be `reference` for a good reason:
+/// `OperationIr::Custom` is a fusion barrier, so the kernel costs whatever elementwise fusion
+/// currently wraps the attention chain, and at short context that could be more than the copies it
+/// removes. The measurements are now in, and they are not the same on every backend, so the
+/// default is per-device rather than one answer for all of them. `kernel` and `reference` are
+/// still absolute: they say run it, or do not, wherever the tensors are.
 fn parse_mode() -> PagedAttentionMode {
     match std::env::var("BURN_LM_PAGED_ATTENTION").as_deref() {
         Ok("kernel") => {
             log::info!("burn-lm paged decode: BURN_LM_PAGED_ATTENTION=kernel");
             PagedAttentionMode::Kernel
         }
-        Ok("reference") | Err(_) => {
-            log::info!("burn-lm paged decode: mode=reference (tensor-op path)");
+        Ok("reference") => {
+            log::info!("burn-lm paged decode: BURN_LM_PAGED_ATTENTION=reference");
             PagedAttentionMode::Reference
         }
+        Ok("auto") | Err(_) => PagedAttentionMode::Auto,
         Ok(other) => {
             log::warn!(
-                "BURN_LM_PAGED_ATTENTION={other:?} is not one of `kernel` / `reference`; \
-                 using `reference`"
+                "BURN_LM_PAGED_ATTENTION={other:?} is not one of `kernel` / `reference` / \
+                 `auto`; using `auto`"
             );
-            PagedAttentionMode::Reference
+            PagedAttentionMode::Auto
         }
     }
 }

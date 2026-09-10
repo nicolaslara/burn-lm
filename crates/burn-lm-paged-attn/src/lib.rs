@@ -86,7 +86,10 @@ pub fn paged_decode(
     n_rep: usize,
     scale: f32,
 ) -> Option<Tensor<4>> {
-    if switch::mode() != PagedAttentionMode::Kernel {
+    // `Auto` cannot be answered yet — it depends on the device, which is a `q.device()` away and
+    // not worth paying for on a shape the kernel would decline anyway. It is resolved below,
+    // after the cheap metadata gates.
+    if switch::mode() == PagedAttentionMode::Reference {
         return None;
     }
 
@@ -127,6 +130,13 @@ pub fn paged_decode(
     #[cfg(feature = "kernel")]
     {
         let device = q.device();
+        if switch::mode() == PagedAttentionMode::Auto
+            && !backend::device_defaults_to_kernel(&device)
+        {
+            // This backend has not earned the default. Say nothing: an opt-out that logs a warning
+            // every round is noise, and `BURN_LM_PAGED_ATTENTION=kernel` is the way in.
+            return None;
+        }
         if !backend::device_supports(&device, n, num_kv_heads, head_dim) {
             // Say so once. This is the gate that turns "the kernel was asked for" into "the kernel
             // never ran", and it is otherwise indistinguishable from "the kernel did not help".

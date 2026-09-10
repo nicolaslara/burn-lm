@@ -1284,6 +1284,45 @@ fn a_plans_mask_lengths_and_block_table_agree() {
     }
 }
 
+/// On Metal, an unconfigured process gets the kernel.
+///
+/// `BURN_LM_PAGED_ATTENTION` defaults to `auto`, and `auto` is answered per device. Metal answers
+/// yes — the roofline bench below has the kernel ahead of the tensor-op reference at every point
+/// of its grid, by 1.2x at the worst corner and about 20x at 4096 tokens across 32 lanes. This
+/// test is what keeps that default from quietly becoming a lie: every other test in this file
+/// forces a mode, so not one of them would notice if `auto` stopped reaching the kernel.
+///
+/// It deliberately does NOT call `force_mode`. The mode is a thread-local override on top of the
+/// env switch and libtest gives each test its own thread, so this thread sees the real default —
+/// unless the environment overrides it, which is the one case worth skipping rather than failing
+/// over.
+#[cfg(feature = "metal")]
+#[test]
+fn metal_runs_the_kernel_without_being_asked() {
+    if std::env::var("BURN_LM_PAGED_ATTENTION").is_ok() {
+        // The environment is making the decision, so there is no default left to test.
+        return;
+    }
+    let case = Case {
+        block_size: 4,
+        lengths: vec![7, 3],
+        n_rep: 2,
+        head_dim: 64,
+        num_kv_heads: 2,
+    };
+    let device = f32_device();
+    let Round {
+        mut cache, plan, q, ..
+    } = build_round(&case, &device, 0xD3FA);
+    let before = kernel_launches();
+    let out = paged_attention(q, layer(&mut cache), &plan, case.n_rep);
+    let _ = host(out);
+    assert!(
+        kernel_launches() > before,
+        "with BURN_LM_PAGED_ATTENTION unset, a Metal decode round did not take the kernel path"
+    );
+}
+
 /// The roofline bench: what the kernel actually costs against what its reads cost.
 ///
 /// Attention only — no model, no other layers — at the Llama-3.2-1B decode geometry (8 KV heads,
