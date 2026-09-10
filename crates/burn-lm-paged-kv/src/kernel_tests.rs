@@ -1307,8 +1307,13 @@ fn bench_paged_decode_against_the_reference() {
     let dev = f32_device();
     let (num_kv_heads, n_rep, head_dim, block_size) = (8usize, 4usize, 64usize, 128usize);
     let num_heads = num_kv_heads * n_rep;
-    let rounds = 20;
-    let warmup = 5;
+    let rounds = 10;
+    let warmup = 3;
+    // Launches enqueued per host sync. A single-round readback on this geometry is dominated by
+    // submit + readback latency (several milliseconds of it), which hides whatever the kernel
+    // itself costs; batching the launches behind one sync amortizes that to where the number
+    // being reported is the kernel's.
+    let inner = 20;
 
     println!(
         "paged decode vs reference, f32, kv_heads {num_kv_heads} x n_rep {n_rep}, head_dim \
@@ -1372,10 +1377,14 @@ fn bench_paged_decode_against_the_reference() {
                         start = std::time::Instant::now();
                     }
                     let l = cache.layers_mut().next().unwrap();
+                    let mut last = None;
+                    for _ in 0..inner {
+                        last = Some(paged_attention(q.clone(), l, &plan, n_rep));
+                    }
                     // The readback is the sync: without it this would time enqueueing.
-                    let _ = host(paged_attention(q.clone(), l, &plan, n_rep));
+                    let _ = host(last.unwrap());
                 }
-                start.elapsed().as_secs_f64() * 1e3 / rounds as f64
+                start.elapsed().as_secs_f64() * 1e3 / (rounds * inner) as f64
             };
 
             let launches_before = kernel_launches();
