@@ -60,6 +60,6 @@ pub use block_store::RaggedKv;
 /// [`PagedKvCache`] can drive both implementations without depending on the kernel crate directly.
 /// `burn-lm-llama`'s model-level gate is the caller: it runs the same decoder twice, once each way,
 /// and asserts the kernel actually ran — a silent fallback is by design, and that cuts both ways.
-pub use burn_lm_paged_attn::{force_mode, kernel_launches, PagedAttentionMode};
+pub use burn_lm_paged_attn::{force_mode, kernel_launches, set_output_scale, PagedAttentionMode};
 pub use cache::*;
 pub use kv_cache::*;

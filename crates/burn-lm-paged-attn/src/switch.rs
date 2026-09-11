@@ -1,7 +1,7 @@
 //! The opt-in switch, and the counter that keeps a silent fallback from being invisible.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 /// Which paged-attention implementation the process runs.
@@ -95,4 +95,31 @@ pub(crate) fn count_launch() {
 /// equivalence passes just as happily when the kernel never ran. Assert this moved.
 pub fn kernel_launches() -> usize {
     LAUNCHES.load(Ordering::Relaxed)
+}
+
+/// A deliberate error injected into the kernel's epilogue, for proving that the GPU ran *this*
+/// kernel.
+///
+/// The launch counter says a host code path was taken; it cannot say the device executed the
+/// kernel body, because our own host code is what increments it. This scalar is multiplied into
+/// the kernel's final division, inside the compiled kernel source and nowhere else, so an output
+/// that moves when it is set is direct evidence that the numbers came out of the kernel rather
+/// than out of the fallback.
+///
+/// Process-wide, unlike `force_mode`, and not by preference: the launch happens on the dispatch
+/// backend's worker thread, not the thread that called `paged_decode`, so a thread-local would
+/// never be seen by the launch. A test that sets it therefore has to own the process — which is
+/// why the one that does lives in its own integration-test binary.
+///
+/// Nothing in serving sets it, and at `1.0` it costs one multiply per output vector.
+static OUTPUT_SCALE: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0f32
+
+/// Set the epilogue's injected output scale, process-wide. `1.0` is the real kernel.
+pub fn set_output_scale(scale: f32) {
+    OUTPUT_SCALE.store(scale.to_bits(), Ordering::Relaxed);
+}
+
+#[cfg_attr(not(feature = "kernel"), allow(dead_code))]
+pub(crate) fn output_scale() -> f32 {
+    f32::from_bits(OUTPUT_SCALE.load(Ordering::Relaxed))
 }

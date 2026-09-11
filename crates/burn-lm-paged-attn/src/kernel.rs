@@ -124,6 +124,7 @@ fn paged_decode_kernel<E: Float, I: Int, N: Size>(
     lengths: &Tensor<I>,            // [n]
     out: &mut Tensor<Vector<E, N>>, // [n, num_heads, 1, head_dim]
     scale: f32,
+    out_scale: f32,
     block_size: u32,
     blocks_per_lane: u32,
     num_kv_heads: u32,
@@ -252,7 +253,7 @@ fn paged_decode_kernel<E: Float, I: Int, N: Size>(
         for g in 0..n_rep {
             let head = kv_head * n_rep + g;
             let obase = (lane * num_heads + head) * slots;
-            let inv = Vector::<f32, N>::new(f32::new(1.0) / max(l[g], f32::new(1.0e-30)));
+            let inv = Vector::<f32, N>::new(out_scale / max(l[g], f32::new(1.0e-30)));
             #[unroll]
             for i in 0..dpu {
                 let slot = u + i * plane_dim;
@@ -319,7 +320,7 @@ fn paged_decode_kernel<E: Float, I: Int, N: Size>(
                 }
                 let head = kv_head * n_rep + g;
                 let obase = (lane * num_heads + head) * slots;
-                let inv = Vector::<f32, N>::new(f32::new(1.0) / max(l_all, f32::new(1.0e-30)));
+                let inv = Vector::<f32, N>::new(out_scale / max(l_all, f32::new(1.0e-30)));
                 #[unroll]
                 for i in 0..dpu {
                     let slot = u + i * plane_dim;
@@ -571,6 +572,7 @@ pub(crate) fn launch<R: CubeRuntime>(
         lengths.into_tensor_arg(),
         out.clone().into_tensor_arg(),
         scale,
+        crate::switch::output_scale(),
         block_size as u32,
         blocks_per_lane as u32,
         num_kv_heads as u32,

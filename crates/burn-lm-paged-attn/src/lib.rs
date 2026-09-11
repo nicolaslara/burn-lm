@@ -40,10 +40,14 @@ mod backend;
 mod kernel;
 
 mod oracle;
+#[cfg(feature = "kernel")]
+mod selfcheck;
 mod switch;
 
 pub use oracle::{decode_reference_online, DecodeShape};
-pub use switch::{force_mode, kernel_launches, PagedAttentionMode};
+#[cfg(feature = "kernel")]
+pub use selfcheck::{dispatch_self_check, SelfCheck};
+pub use switch::{force_mode, kernel_launches, set_output_scale, PagedAttentionMode};
 
 use burn::tensor::{DType, Int, Tensor};
 
