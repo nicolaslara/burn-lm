@@ -662,6 +662,7 @@ fn step<S: BatchedInferenceServer>(
     // Read the chunked-prefill width now, while we still hold only `&self` — the same reason the
     // sampler is taken owned above: it must not collide with the `&mut` decoder borrow below.
     let chunk_size = server.prefill_chunk_size();
+    let prefill_token_budget = server.prefill_token_budget();
 
     // Before the round runs, settle who may grow. Under elastic admission a sequence's
     // reservation covers its prompt but not its whole generation, so each round the worker grants
@@ -686,9 +687,11 @@ fn step<S: BatchedInferenceServer>(
     // rather than panic the worker we retire every active sequence with that error.
     let outcomes = match server.decoder() {
         Ok(decoder) => {
-            // One prefill budget covers the whole round and is computed across the full active set,
-            // so a single long prompt can't hold up the in-flight decoders for more than one round.
-            let mut budget = PrefillBudget::for_round(active);
+            // One prefill budget covers the whole round and is computed across the full active
+            // set, so the round spends a bounded number of tokens on prompt admission however many
+            // prompts are waiting — and a burst of short prompts all goes in at once instead of one
+            // per round.
+            let mut budget = PrefillBudget::for_round(active, prefill_token_budget);
             // The sampler carries no per-sequence state — any randomness it needs is drawn from the
             // backend RNG — so the round's whole job is to hand `step_round` the one shared sampler.
             step_round(
