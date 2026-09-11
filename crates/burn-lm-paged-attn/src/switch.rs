@@ -29,16 +29,16 @@ pub enum PagedAttentionMode {
 fn parse_mode() -> PagedAttentionMode {
     match std::env::var("BURN_LM_PAGED_ATTENTION").as_deref() {
         Ok("kernel") => {
-            log::info!("burn-lm paged decode: BURN_LM_PAGED_ATTENTION=kernel");
+            tracing::info!("burn-lm paged decode: BURN_LM_PAGED_ATTENTION=kernel");
             PagedAttentionMode::Kernel
         }
         Ok("reference") => {
-            log::info!("burn-lm paged decode: BURN_LM_PAGED_ATTENTION=reference");
+            tracing::info!("burn-lm paged decode: BURN_LM_PAGED_ATTENTION=reference");
             PagedAttentionMode::Reference
         }
         Ok("auto") | Err(_) => PagedAttentionMode::Auto,
         Ok(other) => {
-            log::warn!(
+            tracing::warn!(
                 "BURN_LM_PAGED_ATTENTION={other:?} is not one of `kernel` / `reference` / \
                  `auto`; using `auto`"
             );
@@ -85,7 +85,7 @@ pub(crate) fn count_launch() {
     // between the env switch and the GPU said yes. After that, a decade-spaced heartbeat keeps the
     // count visible in a long benchmark without writing a line per decode round.
     if previous == 0 || (previous + 1) % 10_000 == 0 {
-        log::info!("burn-lm paged decode: kernel launches = {}", previous + 1);
+        tracing::info!("burn-lm paged decode: kernel launches = {}", previous + 1);
     }
 }
 

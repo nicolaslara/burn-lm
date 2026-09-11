@@ -1069,7 +1069,7 @@ dependencies = [
  "burn-ir",
  "cubecl",
  "derive-new",
- "log",
+ "tracing",
 ]
 
 [[package]]

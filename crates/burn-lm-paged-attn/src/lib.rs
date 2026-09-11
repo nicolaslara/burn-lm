@@ -142,7 +142,7 @@ pub fn paged_decode(
             // never ran", and it is otherwise indistinguishable from "the kernel did not help".
             static DECLINED: std::sync::Once = std::sync::Once::new();
             DECLINED.call_once(|| {
-                log::warn!(
+                tracing::warn!(
                     "burn-lm paged decode: this device declines the kernel for n={n}, \
                      num_kv_heads={num_kv_heads}, head_dim={head_dim}; using the reference \
                      implementation"

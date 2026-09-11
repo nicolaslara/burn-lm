@@ -501,7 +501,7 @@ pub(crate) fn launch<R: CubeRuntime>(
     // `slice_assign` + in-place `scatter_nd`), but nothing in the type system says so, and a
     // silent permanent disable here looks exactly like "the kernel didn't help".
     if !k_pool.is_contiguous() || !v_pool.is_contiguous() {
-        log::warn!(
+        tracing::warn!(
             "burn-lm paged decode: the KV pools are not contiguous, falling back to the reference \
              implementation for the rest of this process (copying the pool would cost more than \
              the kernel saves)"
