@@ -33,7 +33,33 @@ mod block_store;
 mod cache;
 mod kv_cache;
 
-pub use attention::paged_attention;
+// One accessor for every test device in this crate, so the second one (the f16 grid's) is brought
+// up before anything is running on the first. See the module docs for why that matters.
+#[cfg(test)]
+mod test_device;
+
+// Differential tests for the paged decode kernel. Compiled only when a backend feature turned the
+// kernel on, since there is nothing to differ from otherwise.
+#[cfg(all(
+    test,
+    any(
+        feature = "wgpu",
+        feature = "metal",
+        feature = "vulkan",
+        feature = "webgpu",
+        feature = "cuda"
+    )
+))]
+mod kernel_tests;
+
+pub use attention::{paged_attention, paged_attention_reference};
 pub use block_pool::*;
+pub use block_store::RaggedKv;
+
+/// The decode kernel's switch and launch counter, re-exported so a model that owns a
+/// [`PagedKvCache`] can drive both implementations without depending on the kernel crate directly.
+/// `burn-lm-llama`'s model-level gate is the caller: it runs the same decoder twice, once each way,
+/// and asserts the kernel actually ran — a silent fallback is by design, and that cuts both ways.
+pub use burn_lm_paged_attn::{force_mode, kernel_launches, set_output_scale, PagedAttentionMode};
 pub use cache::*;
 pub use kv_cache::*;

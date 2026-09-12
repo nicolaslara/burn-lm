@@ -608,3 +608,75 @@ fn bench_real_weights_batched_decode_throughput() {
     let prompt: Vec<u32> = (0..16).map(|i| 1000 + i * 13).collect();
     run_bench(&prompt, 50, &mut llama.decoder);
 }
+
+/// The model-level gate for the paged decode kernel.
+///
+/// Every other test in this file runs whatever implementation the process defaults to. This one
+/// runs the *same* decoder twice over the same weights, once with `paged_attention`'s tensor-op
+/// reference and once with the decode kernel, and requires the two to agree token for token.
+///
+/// Two things make it worth its runtime. The differential tests in `burn-lm-paged-kv` feed the
+/// kernel synthetic pools; this feeds it the pools a real forward actually built, at the head_dim
+/// (16, smaller than a plane) and `n_rep` (2) the tiny model has, with prefill on the reference
+/// path and decode on the kernel path inside one conversation. And it asserts the kernel *ran*:
+/// the fallback is silent by design, so an equivalence test alone passes just as happily when the
+/// availability gate declined and both halves ran the same code.
+///
+/// The token streams must match exactly. Attention output differs between the two by ~1e-6
+/// relative — reassociation inside one dot product — and 16 rounds through 2 layers do not turn
+/// that into a different argmax on anything but a genuine tie. A real kernel bug is not 1e-6
+/// wrong: it reads another lane's KV, or drops the rescale, and the stream diverges immediately.
+#[cfg(any(
+    feature = "metal",
+    feature = "wgpu",
+    feature = "vulkan",
+    feature = "webgpu",
+    feature = "cuda",
+    feature = "rocm"
+))]
+#[test]
+fn paged_decode_kernel_matches_the_reference_through_the_real_decoder() {
+    use burn_lm_paged_kv::{force_mode, kernel_launches, PagedAttentionMode};
+
+    let device: Device = Default::default();
+    let prompts = vec![
+        prompt_bytes("This is a long prompt for lane X in the gate", 37),
+        prompt_bytes("Hello", 5),
+        prompt_bytes("A medium length lane Y goes here now", 19),
+    ];
+    let steps = 16;
+
+    // `force_mode` is per-thread, so neither half of this reaches the tests running beside it.
+    force_mode(PagedAttentionMode::Reference);
+    let with_reference = real_decoder_batched_run(&prompts, steps, &device);
+
+    force_mode(PagedAttentionMode::Kernel);
+    let launches_before = kernel_launches();
+    let with_kernel = real_decoder_batched_run(&prompts, steps, &device);
+    let launched = kernel_launches() - launches_before;
+    force_mode(PagedAttentionMode::Reference);
+
+    // One launch per layer per decode round; prefill stays on the reference path.
+    let expected_launches = (steps - 1) * LlamaConfig::llama3_2_1b_test().num_hidden_layers;
+    assert_eq!(
+        launched, expected_launches,
+        "the kernel path was taken {launched} times, expected {expected_launches}: the \
+         availability gate declined, so this test just compared the reference against itself"
+    );
+
+    let tolerance = Tolerance::<f32>::rel_abs(1e-4, 1e-5);
+    for (lane, ((k_tokens, k_logits), (r_tokens, r_logits))) in
+        with_kernel.iter().zip(with_reference.iter()).enumerate()
+    {
+        assert_eq!(
+            k_tokens, r_tokens,
+            "lane {lane}: the paged decode kernel produced a different token stream than the \
+             tensor-op reference"
+        );
+        for (got, expected) in k_logits.iter().zip(r_logits.iter()) {
+            let got = TensorData::new(got.clone(), [got.len()]);
+            let expected = TensorData::new(expected.clone(), [expected.len()]);
+            got.assert_approx_eq::<f32>(&expected, tolerance);
+        }
+    }
+}

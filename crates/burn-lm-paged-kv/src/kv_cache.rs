@@ -1,6 +1,6 @@
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
-use crate::block_store::{write_indices, BlockStore};
+use crate::block_store::{write_indices, BlockStore, RaggedKv};
 use crate::cache::LanePlan;
 
 /// Key-value cache for autoregressive models: a pool of KV blocks, keys and values side by side.
@@ -58,10 +58,24 @@ impl KeyValueCache {
         self.value.write(&idx, value);
     }
 
-    /// Gather the plan's lanes out of both stores, `[n, num_heads, l_max, head_dim]` each. The
+    /// The two raw block pools, K then V, `[num_blocks, block_size, num_heads, head_dim]` each,
+    /// each still carrying the pool's never-written positions — see [`RaggedKv`].
+    ///
+    /// The read half of the paged cache as a *kernel* takes it: no gather, no transpose, no head
+    /// expansion — just the bytes, addressed by a block table. See [`BlockStore::pool`] for the
+    /// contract these handles come with; in short, they must be taken after this round's
+    /// [`write`](Self::write) and dropped before the next one, or every KV write becomes a
+    /// copy-on-write of the whole pool. `attention::paged_attention` is the only caller, and it
+    /// takes them inside the same expression that consumes them.
+    pub(crate) fn pools(&self) -> (RaggedKv, RaggedKv) {
+        (self.key.pool(), self.value.pool())
+    }
+
+    /// Gather the plan's lanes out of both stores, `[n, num_heads, l_max, head_dim]` each, whole
+    /// blocks and all — so each comes back as a [`RaggedKv`] rather than a tensor. The
     /// read half of the paged cache — used by the reference `paged_attention`; a dedicated kernel
     /// reads the blocks in place instead.
-    pub(crate) fn gather(&self, plan: &LanePlan) -> (Tensor<4>, Tensor<4>) {
+    pub(crate) fn gather(&self, plan: &LanePlan) -> (RaggedKv, RaggedKv) {
         let k = self
             .key
             .gather(plan.gather_idx.clone(), plan.blocks_per_lane, plan.l_max);

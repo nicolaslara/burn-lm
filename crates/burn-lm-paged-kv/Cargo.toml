@@ -6,5 +6,27 @@ version = "0.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = []
+
+# Forwarded straight to `burn-lm-paged-attn`. A build that does not turn one of these on keeps the
+# reference implementation everywhere, which is correct — just not accelerated. Whichever crate
+# selects the `burn` backend has to select the matching feature here too, or the kernel is compiled
+# out on the very backend it was meant for; `burn_lm_paged_attn::kernel_launches()` is what makes
+# that visible instead of silent.
+kernel = ["burn-lm-paged-attn/kernel"]
+# The three wgpu specializations imply `wgpu` here for the same reason they do in
+# `burn-lm-paged-attn`: they are the same runtime with a compiler pinned at compile time, and the
+# tests need to know that both dispatch variants exist (the f16 grid puts its pools on one of them
+# precisely because the other is already in use — see `src/test_device.rs`).
+wgpu = ["burn-lm-paged-attn/wgpu"]
+metal = ["wgpu", "burn-lm-paged-attn/metal"]
+vulkan = ["wgpu", "burn-lm-paged-attn/vulkan"]
+webgpu = ["wgpu", "burn-lm-paged-attn/webgpu"]
+cuda = ["burn-lm-paged-attn/cuda"]
+rocm = ["burn-lm-paged-attn/rocm"]
+
 [dependencies]
 burn = { workspace = true, features = ["std", "ndarray"], default-features = false }
+burn-lm-paged-attn = { path = "../burn-lm-paged-attn", version = "0.0.1" }
+log = { workspace = true }
