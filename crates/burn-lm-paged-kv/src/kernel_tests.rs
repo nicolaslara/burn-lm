@@ -30,7 +30,12 @@ use crate::attention::{paged_attention, paged_attention_reference};
 // other threads already have work on the default one spins inside cubecl's channel init.
 use crate::cache::{KvLayout, LanePlan, PagedKvCache};
 use crate::kv_cache::KeyValueCache;
-use crate::test_device::{f16_device, test_device as f32_device};
+use crate::test_device::test_device as f32_device;
+// The f16 grid needs a second dispatch variant to hold the f16 dtype, which only the metal build
+// has (see `test_device`); on every other backend the f16 test below is compiled out, and so is
+// the import that would otherwise fail to resolve.
+#[cfg(all(feature = "metal", feature = "wgpu"))]
+use crate::test_device::f16_device;
 
 /// One case of the differential grid.
 #[derive(Debug, Clone)]
