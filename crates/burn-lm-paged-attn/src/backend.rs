@@ -150,29 +150,37 @@ pub(crate) fn device_supports(
 /// `BURN_LM_PAGED_ATTENTION` unset means "use whichever is faster here", and the honest answer
 /// differs by backend, so it is answered per device rather than by one global default.
 ///
-/// **Metal: yes.** On an M1 Max the kernel beats the tensor-op reference everywhere the roofline
-/// bench looks — from 1.2x at the shortest context and one lane to 20x at 4096 tokens across 32
-/// lanes — and it reaches about 300 GB/s of roughly 400 GB/s of hardware bandwidth. There is no
-/// corner of the grid where it loses, which is what a default needs.
+/// **Metal and CUDA: yes.** On both, the kernel beat the tensor-op reference at every point
+/// measured. An M1 Max runs from 1.2x at the shortest context and one lane to 20x at 4096 tokens
+/// across 32 lanes, reaching about 300 GB/s of roughly 400 GB/s of hardware bandwidth. An A10G at
+/// fp16, serving Llama-3.2-1B at width 16, measured 21.6 / 21.2 / 25.5 ms per decode round at
+/// l_max ~100 / ~1000 / ~4000 against 30.0 / 52.9 / ~177 ms for the reference — and at 4000 tokens
+/// the reference could not finish the burst at all.
 ///
-/// **Everywhere else: not yet, and CUDA is the interesting case.** An A10G at fp16 serving
-/// Llama-3.2-1B at width 16 measured 21.6 / 21.2 / 25.5 ms per decode round at l_max ~100 / ~1000
-/// / ~4000 with the kernel, against 30.0 / 52.9 / ~177 ms with the reference — a win at every
-/// context length, and at 4000 tokens the reference could not finish the burst at all. So CUDA is
-/// not staying opt-in because the kernel is slow there. It is staying opt-in because that is one
-/// GPU generation (sm86). sm90 was measured only against the *previous*, unoptimized kernel, where
-/// it came out flat, and the change that produced these numbers — splitting a lane's walk across
-/// the planes of a cube — is exactly the kind of change whose payoff depends on how many warps the
-/// device wanted in the first place. Re-measure an H100 and this becomes a two-line change.
+/// The one CUDA generation not re-measured since the kernel was optimized is sm90, where the
+/// *previous* kernel came out roughly flat (1.13x). That is not a reason to withhold the default,
+/// because the change since then splits a lane's block walk across the planes of a cube, and it
+/// pays in proportion to how starved the device was for parallelism. The old grid was
+/// `num_kv_heads x lanes` — 128 cubes for a batch of 16 — and an H100 has more streaming
+/// multiprocessors to feed than an A10G, so it was the *more* starved of the two. The mechanism
+/// predicts a larger gain there, not a smaller one. A device that turns out to disagree can say so
+/// with `BURN_LM_PAGED_ATTENTION=reference`, and this function should grow a case for it.
 ///
-/// `BURN_LM_PAGED_ATTENTION=kernel` is how you ask for it in the meantime, and on CUDA today you
-/// should.
+/// **wgpu, Vulkan, WebGPU, ROCm: not yet**, and the reason is different in kind. Those are not
+/// merely unmeasured hardware but unmeasured *compilation paths* — cubecl generates SPIR-V or
+/// HIP rather than MSL or PTX for them, so neither the Metal nor the CUDA numbers transfer. They
+/// stay opt-in until somebody runs the roofline bench on one.
 pub(crate) fn device_defaults_to_kernel(device: &Device) -> bool {
     #[allow(unused_imports)]
     use burn::backend::DispatchDevice;
 
     #[cfg(feature = "metal")]
     if matches!(device.as_dispatch(), DispatchDevice::Metal(_)) {
+        return true;
+    }
+
+    #[cfg(feature = "cuda")]
+    if matches!(device.as_dispatch(), DispatchDevice::Cuda(_)) {
         return true;
     }
 
