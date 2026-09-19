@@ -1060,10 +1060,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "burn-lm-paged-attn"
+version = "0.0.1"
+dependencies = [
+ "burn",
+ "burn-cubecl",
+ "burn-fusion",
+ "burn-ir",
+ "cubecl",
+ "derive-new",
+ "tracing",
+]
+
+[[package]]
 name = "burn-lm-paged-kv"
 version = "0.0.1"
 dependencies = [
  "burn",
+ "burn-lm-paged-attn",
+ "log",
 ]
 
 [[package]]

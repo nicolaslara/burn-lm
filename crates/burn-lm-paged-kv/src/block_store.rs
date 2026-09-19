@@ -1,5 +1,7 @@
 use burn::tensor::{Device, IndexingUpdateOp, Int, Tensor};
 
+use crate::cache::LanePlan;
+
 #[derive(Debug, Clone)]
 /// A fixed-size pool of KV blocks, shaped `[num_blocks, block_size, num_heads, head_dim]` —
 /// token-major, so a logical position is one row of the leading two dims and a whole round's
@@ -33,7 +35,8 @@ impl BlockStore {
         Self { pool }
     }
 
-    /// Tokens per block.
+    /// Tokens per block. Only the tests need to ask: everything else is handed its indices.
+    #[cfg(test)]
     fn block_size(&self) -> usize {
         self.pool.shape()[1]
     }
@@ -57,6 +60,19 @@ impl BlockStore {
             .inplace(|pool| pool.scatter_nd(idx, rows, IndexingUpdateOp::Assign));
     }
 
+    /// The raw pool tensor, `[num_blocks, block_size, num_heads, head_dim]`.
+    ///
+    /// For the paged-attention kernel, which addresses the blocks in place instead of gathering
+    /// them. The returned value is a handle (a refcount bump), not a copy — and that is exactly why
+    /// it must not be held: `write` mutates through `inplace`/`scatter_nd`, which only skips a full
+    /// copy while the pool handle is uniquely owned, so a clone kept alive across a later round's
+    /// writes turns every KV write into a copy-on-write of the whole pool. Take it, use it, drop
+    /// it, in that order, inside one call. Same contract as the clone in
+    /// [`gather`](Self::gather).
+    pub(crate) fn pool(&self) -> RaggedKv {
+        RaggedKv(self.pool.clone())
+    }
+
     /// Read `l_max` positions for each of `n` lanes as one `[n, num_heads, l_max, head_dim]`
     /// tensor, from a caller-built gather index: `idx` holds `n · blocks_per_lane` block ids, each
     /// lane's covering blocks in position order, short lanes padded with the sentinel. The index is
@@ -76,7 +92,7 @@ impl BlockStore {
         idx: Tensor<1, Int>,
         blocks_per_lane: usize,
         l_max: usize,
-    ) -> Tensor<4> {
+    ) -> RaggedKv {
         let [_, bs, heads, head_dim] = self.pool.dims();
         let nb = blocks_per_lane;
         let n = idx.dims()[0] / nb;
@@ -88,12 +104,101 @@ impl BlockStore {
         // the writes: `write` mutates through `inplace`/`scatter_nd`, which only skips a full copy
         // while the pool handle is uniquely owned. A pool clone held across the writes would turn
         // every layer's KV write into a copy-on-write of the whole pool.
-        self.pool
+        RaggedKv(
+            self.pool
+                .clone()
+                .select(0, idx)
+                .reshape([n, nb * bs, heads, head_dim])
+                .swap_dims(1, 2)
+                .slice([0..n, 0..heads, 0..l_max, 0..head_dim]),
+        )
+    }
+}
+
+/// KV read out of the block pool, with the positions nobody ever wrote still in it.
+///
+/// [`BlockStore::new`] allocates the pool with `Tensor::empty` and zeroes only the sentinel block.
+/// From then on the only elements anything writes are a lane's own positions `[0, len)`. Every
+/// other element — the dead tail of a lane's last block, and the whole of any block the pool has
+/// not handed out yet — is whatever the allocator had lying around. That is not "stale KV from an
+/// earlier sequence"; on the first pass through a fresh pool it is arbitrary bit patterns, and an
+/// arbitrary 32-bit pattern is a NaN or an infinity about one time in 256.
+///
+/// **Masking is not a defence against those bytes.** A mask correctly gives a dead column zero
+/// attention weight, and the value aggregation then computes `0 · V_dead` — which is NaN when
+/// `V_dead` is NaN, because that is what IEEE arithmetic says. One NaN in an unwritten tail turns
+/// the whole output row NaN, and from there the whole forward.
+///
+/// So a read does not hand back a plain tensor; it hands back this, and there are exactly two ways
+/// out, mirroring `MaybeUninit`/`assume_init`:
+///
+/// - [`neutralized`](Self::neutralized) — write finite zeros over every dead column, for a
+///   consumer that touches whole blocks and masks afterwards (the tensor-op reference).
+/// - [`assume_length_gated`](Self::assume_length_gated) — the unchecked exit, for a consumer that
+///   provably never looks past a lane's length (the decode kernel).
+///
+/// Both layouts the pool is read in are covered: the gathered per-lane scratch from
+/// [`BlockStore::gather`], `[n, kv_heads, l_max, head_dim]`, and the raw pool from
+/// [`BlockStore::pool`], `[num_blocks, block_size, kv_heads, head_dim]`. What the type tracks is
+/// where the bytes came from, not how they are shaped — and they came from memory nobody
+/// initialized. Only the gathered layout can be neutralized, because only it has a lane per row
+/// for the plan's mask to line up against.
+#[must_use = "this KV still holds never-written positions: `neutralized` zeroes them, \
+              `assume_length_gated` asserts this consumer stops at each lane's length"]
+pub struct RaggedKv(Tensor<4>);
+
+impl RaggedKv {
+    /// Write finite zeros over every position past each lane's own length, and hand back the
+    /// tensor.
+    ///
+    /// This is the exit for a consumer that reads whole blocks and relies on a mask — which cannot
+    /// work on its own, for the `0 · NaN` reason on the type. Zeros are the right filler: they are
+    /// what the sentinel block already holds, they keep the masked softmax's arithmetic finite,
+    /// and the mask still removes the columns afterwards, so nothing about the *answer* depends on
+    /// the value chosen.
+    ///
+    /// Callers neutralize both K and V even though only V can carry the NaN into the answer — a
+    /// dead K feeds a score the mask overwrites. Zeroing K as well costs one more pass over the
+    /// same-sized tensor and buys a rule that fits in one sentence: nothing past a length is ever
+    /// handed to the reference. A rule with an exception in it is the kind that gets misapplied.
+    ///
+    /// Costs a quarter of what it would after grouped-query expansion, and callers must keep it
+    /// that way: this runs on the `[n, kv_heads, l_max, head_dim]` gather, before `repeat_kv`
+    /// turns `kv_heads` into `kv_heads · n_rep`.
+    pub fn neutralized(self, plan: &LanePlan) -> Tensor<4> {
+        let [n, heads, l_max, head_dim] = self.0.dims();
+        let [mask_n, _, seq_q, mask_l_max] = plan.mask.dims();
+        debug_assert_eq!(
+            [mask_n, mask_l_max],
+            [n, l_max],
+            "neutralized got a plan that does not describe this gather"
+        );
+        // The last query row is the one whose live columns are the lane's whole history: row `r`
+        // may attend to `0..=starts[j] + r`, so row `seq_q - 1` masks exactly the columns at or
+        // past `starts[j] + seq_q`, which is the lane's length after this round. Earlier rows also
+        // hide the lane's own future, and those columns are live memory that must survive.
+        let dead = plan
+            .mask
             .clone()
-            .select(0, idx)
-            .reshape([n, nb * bs, heads, head_dim])
-            .swap_dims(1, 2)
-            .slice([0..n, 0..heads, 0..l_max, 0..head_dim])
+            .slice([0..n, 0..1, seq_q - 1..seq_q, 0..l_max])
+            .reshape([n, 1, l_max, 1])
+            .expand([n, heads, l_max, head_dim]);
+        self.0.mask_fill(dead, 0.0)
+    }
+
+    /// Take the tensor as it is, never-written positions included.
+    ///
+    /// Named after `MaybeUninit::assume_init`, and the assertion has the same shape. The caller is
+    /// **not** claiming that anybody zeroed this memory — nobody did. It is claiming that it never
+    /// reads the parts that were never written: for a lane of length `len` over blocks of
+    /// `block_size`, that it walks exactly `min(block_size, len - b·block_size)` positions of
+    /// block `b` and stops there, and that it never touches a block outside the lane's own table.
+    ///
+    /// Break that and there is no mask underneath to catch it. The bytes past a length are
+    /// arbitrary, one NaN among them is enough to make an output row NaN, and on a pool that has
+    /// churned they are a live sequence's keys and values instead.
+    pub fn assume_length_gated(self) -> Tensor<4> {
+        self.0
     }
 }
 
@@ -148,6 +253,22 @@ mod tests {
         store.write(&idx, rows);
     }
 
+    /// Read back through [`BlockStore::gather`].
+    ///
+    /// These tests are the length-gated consumer themselves: each one asserts only over the
+    /// positions it wrote, and the one that reads a short lane's stale tail says so and does not
+    /// assert on it. That is exactly the invariant [`RaggedKv::assume_length_gated`] names.
+    fn gathered(
+        store: &BlockStore,
+        idx: Tensor<1, Int>,
+        blocks_per_lane: usize,
+        l_max: usize,
+    ) -> Tensor<4> {
+        store
+            .gather(idx, blocks_per_lane, l_max)
+            .assume_length_gated()
+    }
+
     /// The gather index `prepare_lanes` would build: each table's blocks in order, sentinel-padded
     /// to `nb` entries per lane.
     fn idx_for(tables: &[Vec<u32>], nb: usize) -> Tensor<1, Int> {
@@ -165,7 +286,7 @@ mod tests {
     /// store must follow the indices it is handed, nothing else.
     #[test]
     fn test_writes_land_at_ragged_positions_and_blocks_recycle() {
-        let device: Device = Default::default();
+        let device = crate::test_device::test_device();
         // [num_blocks=4 (sentinel + 3), block_size=8, heads=1, head_dim=2]
         let mut store = BlockStore::new(4, 8, 1, 2, &device);
         let t0 = vec![3u32]; // lane 0 -> block 3
@@ -188,7 +309,7 @@ mod tests {
         let step = Tensor::<4>::from_data([[[[10.0, 10.0]]], [[[30.0, 30.0]]]], &device);
         let tables = [t0.clone(), t2.clone()];
         write(&mut store, &tables, &[3, 1], step);
-        let out = store.gather(idx_for(&tables, 1), 1, 4);
+        let out = gathered(&store, idx_for(&tables, 1), 1, 4);
         assert_eq!(out.dims(), [2, 1, 4, 2]);
         out.clone()
             .slice([0..1, 0..1, 0..4, 0..2])
@@ -209,7 +330,7 @@ mod tests {
             &[0],
             Tensor::full([1, 1, 2, 2], 7.0, &device),
         );
-        let out = store.gather(idx_for(std::slice::from_ref(&t0), 1), 1, 2);
+        let out = gathered(&store, idx_for(std::slice::from_ref(&t0), 1), 1, 2);
         out.to_data()
             .assert_eq(&TensorData::from([[[[7.0f32, 7.0], [7.0, 7.0]]]]), false);
     }
@@ -221,7 +342,7 @@ mod tests {
     /// write-address or gather-order bug is caught before attention numerics can hide it.
     #[test]
     fn scripted_writes_reproduce_slab_contents_exactly() {
-        let device: Device = Default::default();
+        let device = crate::test_device::test_device();
         let mut store = BlockStore::new(3, 6, 1, 1, &device);
         let t0 = vec![2u32];
         let t1 = vec![1u32];
@@ -236,7 +357,7 @@ mod tests {
         );
         let tables = [t0, t1];
         write(&mut store, &tables, &[4, 3], step);
-        let out = store.gather(idx_for(&tables, 1), 1, 5);
+        let out = gathered(&store, idx_for(&tables, 1), 1, 5);
 
         assert_eq!(out.dims(), [2, 1, 5, 1]);
         out.clone()
@@ -254,7 +375,7 @@ mod tests {
     /// logic left to test, only the arithmetic.
     #[test]
     fn writes_cross_block_boundaries_and_read_back_contiguously() {
-        let device: Device = Default::default();
+        let device = crate::test_device::test_device();
         let mut store = BlockStore::new(5, 4, 1, 1, &device);
         // Deliberately unordered, non-contiguous ids: position i·4.. lives in table[i].
         let table = vec![3u32, 1, 4];
@@ -271,7 +392,7 @@ mod tests {
             &[2],
             vals(500, 2..11),
         );
-        let out = store.gather(idx_for(std::slice::from_ref(&table), 3), 3, 11);
+        let out = gathered(&store, idx_for(std::slice::from_ref(&table), 3), 3, 11);
         assert_eq!(out.dims(), [1, 1, 11, 1]);
         out.to_data().assert_eq(&expect(500, 11), false);
 
@@ -288,7 +409,7 @@ mod tests {
             &[12],
             vals(500, 12..13),
         );
-        let out = store.gather(idx_for(std::slice::from_ref(&grown), 4), 4, 13);
+        let out = gathered(&store, idx_for(std::slice::from_ref(&grown), 4), 4, 13);
         out.to_data().assert_eq(&expect(500, 13), false);
     }
 
@@ -296,7 +417,7 @@ mod tests {
     /// missing blocks come back as the zeroed sentinel — provably zeros, not another lane's data.
     #[test]
     fn short_lanes_pad_with_the_sentinel_never_a_live_block() {
-        let device: Device = Default::default();
+        let device = crate::test_device::test_device();
         let mut store = BlockStore::new(5, 2, 1, 1, &device);
         let long = vec![1u32, 2]; // positions 0..4
         let short = vec![3u32]; // positions 0..2
@@ -321,7 +442,7 @@ mod tests {
         );
         let tables = [long_grown, short];
         write(&mut store, &tables, &[4, 1], step);
-        let out = store.gather(idx_for(&tables, 3), 3, 5);
+        let out = gathered(&store, idx_for(&tables, 3), 3, 5);
         assert_eq!(out.dims(), [2, 1, 5, 1]);
         out.clone()
             .slice([0..1, 0..1, 0..5, 0..1])
@@ -339,7 +460,7 @@ mod tests {
     /// The sentinel block is zeroed at construction and no write may touch it.
     #[test]
     fn sentinel_block_stays_zeroed() {
-        let device: Device = Default::default();
+        let device = crate::test_device::test_device();
         let mut store = BlockStore::new(3, 4, 1, 1, &device);
         write(
             &mut store,

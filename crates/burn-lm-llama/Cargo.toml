@@ -38,6 +38,21 @@ hf = [
     "burn-store/memmap",
 ]
 
+# The paged decode kernel, one feature per backend it has an implementation for.
+#
+# These carry no `burn/<backend>` of their own on purpose: whoever picks the backend for the binary
+# already did that, and duplicating it here would let a build turn on the kernel for a backend the
+# model is not running on. What they do is make sure the kernel is *compiled in* for the backend
+# that was picked — without them `burn-lm-paged-kv` builds with no backend feature at all, the
+# availability gate answers `None` forever, and the only symptom is that
+# `BURN_LM_PAGED_ATTENTION=kernel` quietly does nothing.
+metal = ["burn-lm-paged-kv/metal"]
+wgpu = ["burn-lm-paged-kv/wgpu"]
+vulkan = ["burn-lm-paged-kv/vulkan"]
+webgpu = ["burn-lm-paged-kv/webgpu"]
+cuda = ["burn-lm-paged-kv/cuda"]
+rocm = ["burn-lm-paged-kv/rocm"]
+
 # To import pytorch weights
 import = ["burn-store/pytorch"]
 
@@ -50,18 +65,21 @@ test-cuda = [
     "burn/fusion",
     "burn/autotune",
     # "burn/autotune-checks",
+    "cuda",
     "test-non-default",
 ]
 test-wgpu = [
     "burn/wgpu",
     "burn/default",
     # "burn/autotune-checks",
+    "wgpu",
     "test-non-default",
 ]
 # Bench/test on the same backend the Metal server uses.
 test-metal = [
     "burn/metal",
     "burn/default",
+    "metal",
     "test-non-default",
 ]
 

@@ -14,11 +14,14 @@ readme.workspace = true
 [features]
 f16 = ["burn-lm-inference/f16"]
 bf16 = ["burn-lm-inference/f16"]
-cuda = ["burn-lm-inference/cuda"]
-rocm = ["burn-lm-inference/rocm"]
-wgpu = ["burn-lm-inference/wgpu"]
-vulkan = ["burn-lm-inference/vulkan"]
-metal = ["burn-lm-inference/metal"]
+# Each backend is selected in `burn-lm-inference` and, in the same breath, forwarded to the
+# registry's plugins so the paged decode kernel is compiled in for it. Selecting only the first
+# half builds a server that runs on the GPU but has no kernel to switch on.
+cuda = ["burn-lm-inference/cuda", "burn-lm-registry/cuda"]
+rocm = ["burn-lm-inference/rocm", "burn-lm-registry/rocm"]
+wgpu = ["burn-lm-inference/wgpu", "burn-lm-registry/wgpu"]
+vulkan = ["burn-lm-inference/vulkan", "burn-lm-registry/vulkan"]
+metal = ["burn-lm-inference/metal", "burn-lm-registry/metal"]
 
 libtorch-cuda = ["burn-lm-inference/libtorch"]
 libtorch-cpu = ["burn-lm-inference/libtorch-cpu"]
