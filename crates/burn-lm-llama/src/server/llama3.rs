@@ -66,6 +66,20 @@ pub struct Llama3ServerConfig {
     /// starting in a later change.
     #[config(default = 512)]
     pub prefill_chunk_size: usize,
+    /// How many prompt tokens the whole round may prefill, shared across every prompt waiting to go
+    /// in while other sequences decode. This is what paces prompt admission: it used to be a count
+    /// (one prompt per round), which made a burst of N requests wait N rounds before the last one
+    /// saw a token even when all N prompts together were smaller than a single chunk. Counting
+    /// tokens keeps the same protection — a bounded amount of prefill work per round, so the
+    /// in-flight decoders are never stalled for long — while letting a burst of short prompts share
+    /// one round. `0` means unbounded (every waiting prompt goes in, whatever the cost to this
+    /// round's decoders). The default is one chunk's worth: exactly the work the old rule allowed a
+    /// single long prompt, now spendable on many short ones instead. Raise it to admit bursts even
+    /// faster at the cost of a longer round (and so a slower token for sequences already
+    /// streaming); lower it to protect inter-token latency. Resolved at load via
+    /// `BURN_LM_PREFILL_TOKEN_BUDGET`.
+    #[config(default = 512)]
+    pub prefill_token_budget: usize,
     /// The KV pool size, in tokens. `0` (the default) sizes the pool to the full rectangle —
     /// `max_slots × max_seq_len`, every lane able to reach the context window at once, the old
     /// slab's capacity. A non-zero value decouples the pool from the rectangle: set it to what the
@@ -376,6 +390,16 @@ macro_rules! impl_batched_llama_server {
                     }
                 };
                 BatchCapacity { max_slots, kv }
+            }
+
+            fn prefill_token_budget(&self) -> usize {
+                // The round's shared prompt-admission allowance (see the config field). Resolved
+                // with the same env-override mechanism as the chunk width, so the value the worker
+                // schedules with matches the one logged at load.
+                config_usize(
+                    self.config.prefill_token_budget,
+                    "BURN_LM_PREFILL_TOKEN_BUDGET",
+                )
             }
 
             fn prefill_chunk_size(&self) -> usize {
@@ -750,6 +774,9 @@ impl Llama3BaseServer {
             let prefill_chunk_size =
                 config_usize(config.prefill_chunk_size, "BURN_LM_PREFILL_CHUNK_SIZE");
             tracing::info!(target: "batching", prefill_chunk_size, "prefill chunk size");
+            let prefill_token_budget =
+                config_usize(config.prefill_token_budget, "BURN_LM_PREFILL_TOKEN_BUDGET");
+            tracing::info!(target: "batching", prefill_token_budget, "prefill token budget");
             let kv_pool_tokens = config_usize(config.kv_pool_tokens, "BURN_LM_KV_POOL_TOKENS");
             tracing::info!(target: "batching", kv_pool_tokens, "kv pool tokens (0 = full rectangle)");
             let model = match self.version {

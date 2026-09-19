@@ -174,6 +174,20 @@ pub trait BatchedInferenceServer: InferenceServer {
         0
     }
 
+    /// How many prompt tokens the whole round may prefill, shared across every prompt waiting to go
+    /// in while other sequences decode (see [`PrefillBudget`]); `0` means unbounded. Like
+    /// `prefill_chunk_size`, this is operator-facing load-time config that lives on the server.
+    ///
+    /// The default is one chunk's worth (`prefill_chunk_size`), which is the natural pairing: it is
+    /// exactly the work the old one-prompt-per-round rule allowed a single long prompt, now
+    /// spendable on many short ones instead. So a long prompt still gets a round to itself while a
+    /// burst of short ones shares one, and a server that turns on chunking gets a matching budget
+    /// without setting a second knob. A server that chunks not at all (the trait default `0`) never
+    /// bounded its per-round prefill work in the first place, and inherits `0` here too.
+    fn prefill_token_budget(&self) -> usize {
+        self.prefill_chunk_size()
+    }
+
     /// Which KV admission policy the worker runs for this server (see [`KvAdmission`]). Elastic is
     /// the default: it is what makes a block pool worth having — capacity tracks what sequences
     /// actually use instead of what they might. A server whose deployment wants the strict
@@ -302,27 +316,38 @@ pub enum StepOutcome {
     Failed(InferenceError),
 }
 
-/// The one-prompt-per-round prefill budget, computed over the full active set at the start of a
-/// round and threaded through the round's `step_round` call.
+/// The per-round prefill budget: how many prompt tokens may be prefilled this round, shared across
+/// every prompt waiting to go in. It is computed over the full active set at the start of a round
+/// and threaded through the round's `step_round` call.
 ///
-/// A prompt prefill is a large forward pass; a decode is a single token. So while any sequence is
-/// mid-decode, at most one prompt may prefill per round, which keeps a long prompt from stalling
-/// the in-flight decoders for more than that one round. With no decoders to stall, prompts run
-/// freely. The budget is computed once and honoured across the prefill pass.
+/// A prompt prefill is a wide forward pass; a decode is one token per sequence. So while any
+/// sequence is mid-decode, the round spends at most `token_budget` tokens on prefill, which keeps
+/// prompt admission from stalling the in-flight decoders for more than that much work. With no
+/// decoders to stall — a cold batch — prompts run freely, all of them, in one round.
+///
+/// This used to be a count: at most ONE prompt per round while anything decoded. That was the right
+/// shape when prefill was all-or-nothing and a single long prompt could stall every decoder for an
+/// unbounded time. Chunked prefill (`prefill_chunk_size`) already bounds one prompt's per-round
+/// work, so the count is now the wrong unit: it makes admission serial in the NUMBER of requests,
+/// and a burst of N short prompts waits N rounds before the last one sees its first token, even
+/// though all N together are a fraction of a single chunk. Counting tokens instead keeps exactly
+/// the same protection — bounded prefill work per round — while letting many short prompts share
+/// one round.
 pub struct PrefillBudget {
-    /// Whether any live sequence is mid-decode this round — it has been through the decoder before
-    /// and now owes exactly one new token — and so would be stalled by a long prefill. (A never-run
-    /// one-token prompt does not count; see `for_round` for why that distinction matters.)
-    any_decoding: bool,
-    /// Set once a prompt has prefilled this round; combined with `any_decoding`, later prompts
-    /// defer.
-    prefilled: bool,
+    /// Prompt tokens still admissible this round. `None` means unbounded: either nothing is
+    /// decoding (there are no decoders to stall) or the driver asked for no limit.
+    remaining: Option<usize>,
 }
 
 impl PrefillBudget {
     /// Compute the budget for one round from the full active set — every sequence the driver will
-    /// step this round.
-    pub fn for_round<X>(active: &[ActiveSeq<X>]) -> Self {
+    /// step this round — and the per-round token allowance.
+    ///
+    /// `token_budget` is the operator's knob (`prefill_token_budget`); `0` means unbounded, the same
+    /// convention `prefill_chunk_size` uses. It only bites while something is decoding: a cold batch
+    /// has no decoders to protect, so every prompt in it prefills at once, which is what the library
+    /// `generate_batch` path relies on.
+    pub fn for_round<X>(active: &[ActiveSeq<X>], token_budget: usize) -> Self {
         // A sequence counts as decoding when it has been through the decoder before (`processed >
         // 0`) and now owes exactly one new token. The `processed > 0` clause is what correctness
         // depends on here: without it a never-run one-token prompt would count as decoding, so a
@@ -334,19 +359,32 @@ impl PrefillBudget {
                 && seq.processed > 0
                 && seq.tokens.len() == seq.processed + 1
         });
-        Self {
-            any_decoding,
-            prefilled: false,
-        }
+        let remaining = if any_decoding && token_budget > 0 {
+            Some(token_budget)
+        } else {
+            None
+        };
+        Self { remaining }
     }
 
-    /// Whether one more prompt may prefill this round. Claims the budget when it answers yes.
-    fn admit_prefill(&mut self) -> bool {
-        if self.prefilled && self.any_decoding {
-            return false;
+    /// How many tokens of `wanted` this prompt may prefill right now, or `None` if the round's
+    /// budget is spent and it must defer. Claims what it grants.
+    ///
+    /// A grant can be SHORTER than asked for: the last prompt to fit in a round takes whatever is
+    /// left and finishes its chunk next round, exactly as a prompt longer than `prefill_chunk_size`
+    /// already does. That is what bounds a round's prefill work in tokens even when the chunk width
+    /// is unbounded. Prompts are offered in active-set order, which is admission order, so the
+    /// budget is spent oldest-first and no prompt can be starved by a later arrival.
+    fn admit_prefill(&mut self, wanted: usize) -> Option<usize> {
+        match &mut self.remaining {
+            None => Some(wanted),
+            Some(0) => None,
+            Some(remaining) => {
+                let granted = wanted.min(*remaining);
+                *remaining -= granted;
+                Some(granted)
+            }
         }
-        self.prefilled = true;
-        true
     }
 }
 
@@ -362,8 +400,8 @@ impl PrefillBudget {
 /// decide what to stream and what to retire.
 ///
 /// A sequence whose unprocessed tail is more than one token is prompt work and prefills, subject to
-/// the caller-supplied `PrefillBudget` (at most one prompt per round while others decode); a
-/// deferred prompt yields `Skipped` and stays prompt work for the next round. Every sequence with
+/// the caller-supplied `PrefillBudget` (a token allowance the round's prompts share while others
+/// decode); a deferred prompt yields `Skipped` and stays prompt work for the next round. Every sequence with
 /// exactly one new token decodes through a single fused `decode` call for the whole round
 /// (`[n, vocab]`), and the whole round's rows are sampled in one batched `sample` call.
 ///
@@ -464,13 +502,11 @@ pub fn step_round<D: BatchedDecoder, X>(
         );
     }
 
-    // Prefill pass: the budget allows at most one prompt per round while anything decodes. Prompts
-    // have different lengths, so each is its own call; a deferred prompt stays Skipped and remains
-    // prompt work for a later round.
+    // Prefill pass: prompts share the round's token budget, spent oldest-first, so a burst of short
+    // prompts all goes in on one round while a long one still takes no more than the budget. Prompts
+    // have different lengths, so each is its own call; a prompt the budget can no longer cover stays
+    // Skipped and remains prompt work for a later round.
     for i in prefills {
-        if !budget.admit_prefill() {
-            continue;
-        }
         let position = active[i].processed;
         let tail_len = active[i].tokens.len();
         // Chunked prefill: process at most `chunk_size` tokens of the unprocessed tail this round, so a
@@ -478,10 +514,16 @@ pub fn step_round<D: BatchedDecoder, X>(
         // for one giant forward. `chunk_size == 0` means unbounded — the whole tail in one round, which
         // is exactly the pre-chunking path. The lane's KV grows by this slice, keeping the cursor
         // (`processed`) and the lane length in lockstep.
-        let chunk_end = if chunk_size == 0 {
-            tail_len
+        let wanted = if chunk_size == 0 {
+            tail_len - position
         } else {
-            (position + chunk_size).min(tail_len)
+            chunk_size.min(tail_len - position)
+        };
+        // The round's shared budget has the final say, and may grant less than the chunk width — see
+        // `admit_prefill`. A grant of nothing means the round is full: defer, untouched.
+        let chunk_end = match budget.admit_prefill(wanted) {
+            Some(0) | None => continue,
+            Some(granted) => position + granted,
         };
         let logits = decoder.prefill(
             active[i].slot,

@@ -15,6 +15,21 @@ fn argmax_rows(logits: burn::tensor::Tensor<2>) -> InferenceResult<Vec<u32>> {
     Argmax.sample(logits)
 }
 
+/// A fresh, never-run prompt in `slot`: nothing processed, nothing generated, room to generate.
+fn prompt_seq(slot: usize, tokens: Vec<u32>) -> ActiveSeq<()> {
+    ActiveSeq {
+        slot,
+        tokens,
+        processed: 0,
+        generated: 0,
+        max_gen: 8,
+        finished: false,
+        kv_reservation: 0,
+        paused: false,
+        extra: (),
+    }
+}
+
 /// Capacity >= 2: both jobs are admitted concurrently and their emission streams INTERLEAVE.
 /// Each sequence's first emission precedes the other's last (structural overlap).
 #[test]
@@ -156,27 +171,14 @@ fn a_retired_sequences_slot_is_reused_with_no_residue() {
     );
 }
 
-/// PREFILL BUDGET: while another sequence is mid-decode, at most ONE prompt prefills per round;
-/// the deferred prompt's tail is untouched and it prefills the next round. This drives
-/// `step_round` exactly like the serving worker does — one fused call for the whole round, sharing
-/// the round's single [`PrefillBudget`] — so a budget regression (a prompt prefilling while another
-/// sequence is decoding) fails here.
+/// PREFILL BUDGET, the bound: while another sequence is mid-decode, the round spends at most
+/// `token_budget` tokens on prompt admission. Two 2-token prompts against a 2-token budget means
+/// the first goes in and the second defers with its tail untouched, prefilling the next round.
+/// This drives `step_round` exactly like the serving worker does — one fused call for the whole
+/// round, sharing the round's single [`PrefillBudget`] — so a budget regression (unbounded prefill
+/// while another sequence is decoding) fails here.
 #[test]
-fn at_most_one_prompt_prefills_per_round_while_another_sequence_decodes() {
-    fn seq(slot: usize, tokens: Vec<u32>) -> ActiveSeq<()> {
-        ActiveSeq {
-            slot,
-            tokens,
-            processed: 0,
-            generated: 0,
-            max_gen: 8,
-            finished: false,
-            kv_reservation: 0,
-            paused: false,
-            extra: (),
-        }
-    }
-
+fn the_round_prefills_no_more_than_its_token_budget_while_another_sequence_decodes() {
     // `emit` is high so nothing stops mid-test.
     let mut decoder = FakeDecoder::new(Arc::new(Mutex::new(Vec::new())), 100);
     let stop_ids = [0u32];
@@ -184,15 +186,19 @@ fn at_most_one_prompt_prefills_per_round_while_another_sequence_decodes() {
     // Slot 0 is GENUINELY mid-decode: its prompt was already prefilled (`processed > 0`) and it
     // owes one new token. (A fresh one-token prompt would NOT count — `PrefillBudget` requires
     // `processed > 0`, so a brand-new batch never defers its own prompts.) Slots 1 and 2 hold
-    // fresh multi-token prompts.
-    let mut mid_decode = seq(0, vec![10, 10]);
+    // fresh 2-token prompts, and the budget has room for exactly one of them.
+    let mut mid_decode = prompt_seq(0, vec![10, 10]);
     mid_decode.processed = 1;
     mid_decode.generated = 1;
-    let mut active = vec![mid_decode, seq(1, vec![11, 11]), seq(2, vec![12, 12])];
+    let mut active = vec![
+        mid_decode,
+        prompt_seq(1, vec![11, 11]),
+        prompt_seq(2, vec![12, 12]),
+    ];
 
     // Round 1: one fused `step_round` call for the whole round (the worker's shape). The shared
     // sampler closure ignores the row index here.
-    let mut budget = PrefillBudget::for_round(&active);
+    let mut budget = PrefillBudget::for_round(&active, 2);
     let outcomes = step_round(
         &mut decoder,
         &mut active,
@@ -208,11 +214,11 @@ fn at_most_one_prompt_prefills_per_round_while_another_sequence_decodes() {
     );
     assert!(
         matches!(outcomes[1], StepOutcome::Stepped { .. }),
-        "exactly one prompt prefills this round"
+        "the first prompt spends the whole budget and prefills this round"
     );
     assert!(
         matches!(outcomes[2], StepOutcome::Skipped),
-        "the second prompt must defer while another sequence is decoding"
+        "the second prompt must defer once the round's budget is spent"
     );
     assert_eq!(
         active[2].processed, 0,
@@ -220,7 +226,7 @@ fn at_most_one_prompt_prefills_per_round_while_another_sequence_decodes() {
     );
 
     // Round 2: a fresh budget admits the deferred prompt.
-    let mut budget = PrefillBudget::for_round(&active);
+    let mut budget = PrefillBudget::for_round(&active, 2);
     let outcome = step_round(
         &mut decoder,
         &mut active[2..3],
@@ -234,6 +240,120 @@ fn at_most_one_prompt_prefills_per_round_while_another_sequence_decodes() {
     assert!(
         matches!(outcome, StepOutcome::Stepped { .. }),
         "the deferred prompt prefills on the next round"
+    );
+}
+
+/// PREFILL BUDGET, the point of the change: a BURST of short prompts arriving while sequences
+/// decode is admitted in ONE round, not one prompt per round. Sixteen 4-token prompts are 64
+/// tokens of prefill — comfortably inside a 512-token budget — so every one of them samples its
+/// first token in the same round. Under the old one-prompt-per-round rule the sixteenth waited
+/// sixteen rounds, which is the burst-latency bug this budget exists to fix.
+#[test]
+fn a_burst_of_short_prompts_is_admitted_in_one_round() {
+    let mut decoder = FakeDecoder::new(Arc::new(Mutex::new(Vec::new())), 100);
+    let stop_ids = [0u32];
+
+    let mut mid_decode = prompt_seq(0, vec![10, 10]);
+    mid_decode.processed = 1;
+    mid_decode.generated = 1;
+    let mut active = vec![mid_decode];
+    for slot in 1..=16 {
+        active.push(prompt_seq(slot, vec![20 + slot as u32; 4]));
+    }
+
+    // 512 is the shipped default: one chunk's worth of prefill work per round.
+    let mut budget = PrefillBudget::for_round(&active, 512);
+    let outcomes = step_round(
+        &mut decoder,
+        &mut active,
+        &stop_ids,
+        &mut budget,
+        512,
+        argmax_rows,
+    );
+
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, StepOutcome::Stepped { .. })),
+        "every short prompt shares the one round's budget: {outcomes:?}"
+    );
+    assert!(
+        active.iter().skip(1).all(|seq| seq.generated == 1),
+        "each admitted prompt sampled its first token this round"
+    );
+}
+
+/// PREFILL BUDGET, the protection it preserves: a LONG prompt still cannot spend more than the
+/// budget in one round, even when the chunk width is unbounded. A 1000-token prompt against a
+/// 512-token budget advances exactly 512 tokens and reports `Prefilling` — no sampling, because
+/// the prompt is not fully in — leaving the in-flight decoder stalled by one budget's work at
+/// most. The budget clamps the chunk, so it bounds the round whatever `chunk_size` says.
+#[test]
+fn a_long_prompt_cannot_exceed_the_round_budget() {
+    let mut decoder = FakeDecoder::new(Arc::new(Mutex::new(Vec::new())), 100);
+    let stop_ids = [0u32];
+
+    let mut mid_decode = prompt_seq(0, vec![10, 10]);
+    mid_decode.processed = 1;
+    mid_decode.generated = 1;
+    let mut active = vec![mid_decode, prompt_seq(1, vec![7u32; 1000])];
+
+    let mut budget = PrefillBudget::for_round(&active, 512);
+    // `chunk_size == 0` is unbounded chunking: without the token budget this whole 1000-token
+    // prompt would go in on one round.
+    let outcomes = step_round(
+        &mut decoder,
+        &mut active,
+        &stop_ids,
+        &mut budget,
+        0,
+        argmax_rows,
+    );
+
+    assert!(
+        matches!(outcomes[1], StepOutcome::Prefilling),
+        "a prompt the budget cannot finish keeps prefilling: {:?}",
+        outcomes[1]
+    );
+    assert_eq!(
+        active[1].processed, 512,
+        "the round prefilled exactly the budget, no more"
+    );
+    assert_eq!(
+        active[1].generated, 0,
+        "no token before the whole prompt is in"
+    );
+}
+
+/// PREFILL BUDGET, the cold-batch case the count rule also got right and the token budget must not
+/// regress: with NOTHING decoding there are no decoders to protect, so every waiting prompt
+/// prefills in the first round however large the batch — even against a budget far too small to
+/// cover it. This is what the library `generate_batch` path relies on.
+#[test]
+fn a_cold_batch_prefills_every_prompt_in_one_round() {
+    let mut decoder = FakeDecoder::new(Arc::new(Mutex::new(Vec::new())), 100);
+    let stop_ids = [0u32];
+    let mut active: Vec<ActiveSeq<()>> = (0..8)
+        .map(|slot| prompt_seq(slot, vec![30 + slot as u32; 4]))
+        .collect();
+
+    // A budget of 1 token would defer everyone if it applied — nothing is decoding, so it doesn't.
+    let mut budget = PrefillBudget::for_round(&active, 1);
+    let outcomes = step_round(
+        &mut decoder,
+        &mut active,
+        &stop_ids,
+        &mut budget,
+        0,
+        argmax_rows,
+    );
+
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, StepOutcome::Stepped { .. })),
+        "a cold batch prefills every prompt at once: {outcomes:?}"
     );
 }
 
@@ -261,7 +381,7 @@ fn decoding_sequences_share_one_fused_decode_call() {
     let stop_ids = [0u32];
     let mut active = vec![decoding(0, 10), decoding(1, 11), decoding(2, 12)];
 
-    let mut budget = PrefillBudget::for_round(&active);
+    let mut budget = PrefillBudget::for_round(&active, 0);
     let outcomes = step_round(
         &mut decoder,
         &mut active,
@@ -324,7 +444,7 @@ fn a_fused_decode_error_retires_every_decode_row_but_not_a_concurrent_prefill() 
     // Three decode rows + one fresh prompt (admitted because the others are decoding).
     let mut active = vec![decoding(0, 10), decoding(1, 11), decoding(2, 12), prompt(3)];
 
-    let mut budget = PrefillBudget::for_round(&active);
+    let mut budget = PrefillBudget::for_round(&active, 0);
     let outcomes = step_round(
         &mut decoder,
         &mut active,
@@ -390,7 +510,7 @@ fn a_mixed_round_aligns_each_sampled_token_to_its_sequence() {
     // seq1 is a fresh prompt (a prefill row); seq0 and seq2 are mid-decode (fused decode rows).
     let mut active = vec![decoding(0, 10), prompt(1), decoding(2, 12)];
 
-    let mut budget = PrefillBudget::for_round(&active);
+    let mut budget = PrefillBudget::for_round(&active, 0);
     // Argmax over the decoder's one-hot logits: the `FakeDecoder` echoes each row's identity token as
     // a one-hot row, so argmax recovers a token unique to that row — the two fused-decode rows their
     // last tokens (10, 12) and the prefill row its prompt token (30). A prefill/decode index mixup in
@@ -446,7 +566,7 @@ fn a_lane_over_the_context_limit_retires_alone_without_failing_its_batch_mates()
     // seq0 reaches length 4 this round (> 3) — over the limit. seq1 reaches 2 (<= 3) — it fits.
     let mut active = vec![decoding(0, vec![10, 10, 10, 10]), decoding(1, vec![11, 11])];
 
-    let mut budget = PrefillBudget::for_round(&active);
+    let mut budget = PrefillBudget::for_round(&active, 0);
     let outcomes = step_round(
         &mut decoder,
         &mut active,
@@ -500,7 +620,7 @@ fn a_prompt_longer_than_the_context_window_is_rejected_before_prefill() {
         extra: (),
     }];
 
-    let mut budget = PrefillBudget::for_round(&active);
+    let mut budget = PrefillBudget::for_round(&active, 0);
     let outcomes = step_round(
         &mut decoder,
         &mut active,
@@ -613,7 +733,7 @@ fn chunked_prefill_defers_sampling_to_the_final_chunk() {
     let mut decoder = FakeDecoder::new(Arc::new(Mutex::new(Vec::new())), 100);
     let mut active = vec![seq((1..=10).collect(), 2)];
     for (round, expected) in [(1usize, 4usize), (2, 8)] {
-        let mut budget = PrefillBudget::for_round(&active);
+        let mut budget = PrefillBudget::for_round(&active, 0);
         let outcomes = step_round(
             &mut decoder,
             &mut active,
@@ -635,7 +755,7 @@ fn chunked_prefill_defers_sampling_to_the_final_chunk() {
             "round {round}: no token before the prompt is fully in"
         );
     }
-    let mut budget = PrefillBudget::for_round(&active);
+    let mut budget = PrefillBudget::for_round(&active, 0);
     let outcomes = step_round(
         &mut decoder,
         &mut active,
@@ -656,7 +776,7 @@ fn chunked_prefill_defers_sampling_to_the_final_chunk() {
     let mut decoder = FakeDecoder::new(Arc::new(Mutex::new(Vec::new())), 100);
     let mut active = vec![seq((1..=9).collect(), 2)];
     for expected in [4usize, 8] {
-        let mut budget = PrefillBudget::for_round(&active);
+        let mut budget = PrefillBudget::for_round(&active, 0);
         let outcomes = step_round(
             &mut decoder,
             &mut active,
@@ -668,7 +788,7 @@ fn chunked_prefill_defers_sampling_to_the_final_chunk() {
         assert!(matches!(outcomes[0], StepOutcome::Prefilling));
         assert_eq!(active[0].processed, expected);
     }
-    let mut budget = PrefillBudget::for_round(&active);
+    let mut budget = PrefillBudget::for_round(&active, 0);
     let outcomes = step_round(
         &mut decoder,
         &mut active,
@@ -709,7 +829,7 @@ fn a_failed_prefill_chunk_retires_the_sequence() {
     decoder.fail_prefills = 1;
     let mut active = vec![seq((1..=10).collect(), 8)];
 
-    let mut budget = PrefillBudget::for_round(&active);
+    let mut budget = PrefillBudget::for_round(&active, 0);
     let outcomes = step_round(&mut decoder, &mut active, &[], &mut budget, 4, argmax_rows);
 
     assert!(
