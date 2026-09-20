@@ -68,8 +68,10 @@ use burn::backend::{Shape, TensorMetadata};
 use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::ops::numeric::empty_device_dtype;
 use burn_cubecl::tensor::CubeTensor;
-use burn_cubecl::CubeRuntime;
-use cubecl::client::ComputeClient;
+// One `Client` for every cubecl runtime, and a `CubeTensor` that does not name one either: since
+// runtime erasure the host side of this file is not generic over a runtime at all. Which runtime a
+// launch lands on is what the tensor's device says, and the client it carries already knows.
+use cubecl::client::Client;
 use cubecl::features::Plane;
 use cubecl::prelude::*;
 
@@ -346,12 +348,7 @@ fn paged_decode_kernel<E: Float, I: Int, N: Size>(
 /// The divisibility is not a nicety: every row base in the kernel is a multiple of `head_dim`, and
 /// that is the whole reason a slot index can be a row base divided by the width without a row ever
 /// starting mid-vector.
-fn vector_width<R: CubeRuntime>(
-    client: &ComputeClient<R>,
-    elem_size: usize,
-    head_dim: usize,
-    plane_dim: usize,
-) -> usize {
+fn vector_width(client: &Client, elem_size: usize, head_dim: usize, plane_dim: usize) -> usize {
     client
         .io_optimized_vector_sizes(elem_size)
         .find(|&width| width <= head_dim / plane_dim.max(1) && head_dim.is_multiple_of(width))
@@ -376,8 +373,8 @@ fn vector_width<R: CubeRuntime>(
 /// - **diminishing returns**: past 32 planes a cube is a whole SM's worth of warps waiting on one
 ///   barrier, and the unrolled merge stops being free.
 #[allow(clippy::too_many_arguments)]
-fn planes_per_cube<R: CubeRuntime>(
-    client: &ComputeClient<R>,
+fn planes_per_cube(
+    client: &Client,
     n: usize,
     num_kv_heads: usize,
     blocks_per_lane: usize,
@@ -424,12 +421,7 @@ fn planes_per_cube<R: CubeRuntime>(
 /// asks it so it can answer `None` and fall back, and [`launch`] asserts it, because reaching the
 /// launch with an unsupported configuration means the gate is wrong — a bug to fail loudly on, not
 /// a runtime condition to absorb.
-pub(crate) fn supported<R: CubeRuntime>(
-    client: &ComputeClient<R>,
-    n: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-) -> bool {
+pub(crate) fn supported(client: &Client, n: usize, num_kv_heads: usize, head_dim: usize) -> bool {
     let props = client.properties();
     let hw = &props.hardware;
 
@@ -462,15 +454,15 @@ pub(crate) fn supported<R: CubeRuntime>(
 /// The two `None` cases are different in kind and deliberately treated the same: an unsupported
 /// device is permanent, a non-contiguous pool is a shape the caller could in principle fix. Both
 /// mean "use the reference".
-pub(crate) fn launch<R: CubeRuntime>(
-    q: CubeTensor<R>,
-    k_pool: CubeTensor<R>,
-    v_pool: CubeTensor<R>,
-    block_table: CubeTensor<R>,
-    lengths: CubeTensor<R>,
+pub(crate) fn launch(
+    q: CubeTensor,
+    k_pool: CubeTensor,
+    v_pool: CubeTensor,
+    block_table: CubeTensor,
+    lengths: CubeTensor,
     n_rep: usize,
     scale: f32,
-) -> Option<CubeTensor<R>> {
+) -> Option<CubeTensor> {
     let q_shape = q.shape();
     let [n, num_heads, seq_q, head_dim] = q_shape.dims::<4>();
     let k_shape = k_pool.shape();
@@ -492,7 +484,7 @@ pub(crate) fn launch<R: CubeRuntime>(
     assert_eq!(lengths.shape().dims::<1>()[0], n, "one length per lane");
 
     let client = q.client.clone();
-    if !supported::<R>(&client, n, num_kv_heads, head_dim) {
+    if !supported(&client, n, num_kv_heads, head_dim) {
         return None;
     }
 
@@ -511,11 +503,11 @@ pub(crate) fn launch<R: CubeRuntime>(
     }
 
     let plane_dim = client.properties().hardware.plane_size_max as usize;
-    let width = vector_width::<R>(&client, q.dtype.size(), head_dim, plane_dim);
+    let width = vector_width(&client, q.dtype.size(), head_dim, plane_dim);
     let slots = head_dim / width;
     let dpu = slots.div_ceil(plane_dim);
     let blocks_per_lane = table_len / n;
-    let planes = planes_per_cube::<R>(
+    let planes = planes_per_cube(
         &client,
         n,
         num_kv_heads,
@@ -532,7 +524,7 @@ pub(crate) fn launch<R: CubeRuntime>(
     let block_table = into_contiguous(block_table);
     let lengths = into_contiguous(lengths);
 
-    let out = empty_device_dtype::<R>(
+    let out = empty_device_dtype(
         client.clone(),
         q.device.clone(),
         Shape::new([n, num_heads, 1, head_dim]),
@@ -556,7 +548,7 @@ pub(crate) fn launch<R: CubeRuntime>(
     let f_dtype = q.dtype;
     let i_dtype = block_table.dtype;
 
-    paged_decode_kernel::launch::<R>(
+    paged_decode_kernel::launch(
         &client,
         CubeCount::Static(num_kv_heads as u32, n as u32, 1),
         // `x` is exactly one plane wide, so a unit's `UNIT_POS_Y` *is* its plane index — which is

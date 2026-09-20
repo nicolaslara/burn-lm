@@ -8,33 +8,20 @@
 //!    `unimplemented!()` in the generated arm — a trait *default body* does not fill those in — so
 //!    the "can we?" question is answered on the host, before this trait is ever reached (see
 //!    [`device_supports`] and `crate::paged_decode`).
-//! 2. `impl for CubeBackend<R>` is one line and covers CUDA, Metal, Vulkan, wgpu and ROCm at once.
-//! 3. `impl for Fusion<B>` is the one the dispatch actually reaches, because `burn::backend::Wgpu`
-//!    *is* `Fusion<CubeBackend<WgpuRuntime>>`. It registers the launch as a `CustomOpIr` on the
-//!    fusion stream so it is ordered against the `scatter_nd` that wrote this round's KV
-//!    immediately before it.
+//! 2. `impl for CubeBackend` is one line and covers CUDA, Metal, Vulkan, wgpu and ROCm at once —
+//!    since cubecl's runtime erasure it does so *literally*, because those runtimes are no longer
+//!    separate types: `CubeBackend` takes no runtime parameter and a tensor's runtime is what its
+//!    device says.
+//! 3. `impl for Fusion<B>` is the one the dispatch actually reaches, because `burn::backend::Cube`
+//!    — which is what the generated arm names — *is* `Fusion<CubeBackend>`. It registers the launch
+//!    as a `CustomOpIr` on the fusion stream so it is ordered against the `scatter_nd` that wrote
+//!    this round's KV immediately before it.
 
 use burn::backend::tensor::{FloatTensor, IntTensor};
 use burn::backend::{backend_extension, Backend};
 use burn::tensor::Device;
 
-// `#[backend_extension]` names each listed backend by its bare type (`<Wgpu as Trait>::…`) as well
-// as by its `DispatchTensorKind` variant, so the types have to be in scope here. Each `use` is
-// gated exactly as the corresponding entry in the attribute below.
-#[cfg(feature = "cuda")]
-use burn::backend::Cuda;
-#[cfg(feature = "metal")]
-use burn::backend::Metal;
-#[cfg(feature = "rocm")]
-use burn::backend::Rocm;
-#[cfg(feature = "vulkan")]
-use burn::backend::Vulkan;
-#[cfg(feature = "webgpu")]
-use burn::backend::WebGpu;
-#[cfg(feature = "wgpu")]
-use burn::backend::Wgpu;
-
-use burn_cubecl::{CubeBackend, CubeRuntime};
+use burn_cubecl::CubeBackend;
 
 use crate::kernel;
 
@@ -45,14 +32,13 @@ use crate::kernel;
 /// assert rather than degrade — with one exception, the pool contiguity check inside
 /// `kernel::launch`, which the host cannot see through a `Tensor` and which therefore has to be
 /// allowed to decline.
-#[backend_extension(
-    Cuda:   cfg(feature = "cuda"),
-    Rocm:   cfg(feature = "rocm"),
-    Metal:  cfg(feature = "metal"),
-    Vulkan: cfg(feature = "vulkan"),
-    Wgpu:   cfg(feature = "wgpu"),
-    WebGpu: cfg(feature = "webgpu"),
-)]
+// One entry, not six. The macro's backend list names *selectors* — `Cube`, `Flex`, `NdArray`,
+// `LibTorch`, `Remote` — and since cubecl's runtime erasure `Cube` is every cubecl runtime at once:
+// CUDA, ROCm, Metal, Vulkan, wgpu, WebGPU and the CPU runtime. `Cuda` and `Wgpu` are no longer
+// spellings the macro accepts, which is why this reads as a loss of CUDA and is not one; what used
+// to be six arms dispatching on the tensor's backend *type* is now one arm, with the runtime
+// carried by the device value inside it.
+#[backend_extension(Cube: cfg(feature = "cube-backend"))]
 pub trait PagedDecodeAttention: Backend {
     /// Attend one query position per lane over the two pools, addressed by `block_table` and
     /// bounded by `lengths`. Returns `[n, num_heads, 1, head_dim]`.
@@ -68,7 +54,7 @@ pub trait PagedDecodeAttention: Backend {
     ) -> FloatTensor<Self>;
 }
 
-impl<R: CubeRuntime> PagedDecodeAttention for CubeBackend<R> {
+impl PagedDecodeAttention for CubeBackend {
     fn paged_decode(
         q: FloatTensor<Self>,
         k_pool: FloatTensor<Self>,
@@ -78,7 +64,7 @@ impl<R: CubeRuntime> PagedDecodeAttention for CubeBackend<R> {
         n_rep: u32,
         scale: f32,
     ) -> FloatTensor<Self> {
-        kernel::launch::<R>(
+        kernel::launch(
             q,
             k_pool,
             v_pool,
@@ -97,52 +83,24 @@ impl<R: CubeRuntime> PagedDecodeAttention for CubeBackend<R> {
 /// Whether the kernel is reachable for `device` at this problem size.
 ///
 /// Two questions in one, both of which have to be answered before the extension trait is called.
-/// Is this device one of the backends the trait lists (otherwise the generated dispatch arm is a
-/// hard `unimplemented!()`), and does its plane geometry fit the kernel? The second needs the
-/// compute client, which is why each arm reaches its own runtime rather than sharing code.
+/// Is this device a cubecl device at all (otherwise the generated dispatch arm is a hard
+/// `unimplemented!()`), and does its plane geometry fit the kernel? The second needs the compute
+/// client, which used to mean one probe per runtime, each naming its own `Runtime` type to reach
+/// `Runtime::client`. Runtime erasure removed both halves of that: the device *is* the runtime
+/// tag, and `CubeDevice::client` hands back the one erased `Client` whatever it names.
+#[allow(unused_variables)]
 pub(crate) fn device_supports(
     device: &Device,
     n: usize,
     num_kv_heads: usize,
     head_dim: usize,
 ) -> bool {
-    #[allow(unused_imports)]
-    use burn::backend::DispatchDevice;
-    #[allow(unused_imports)]
-    use cubecl::Runtime;
-
-    #[allow(unused_mut)]
-    let mut supported = false;
-
-    macro_rules! probe {
-        ($variant:ident, $runtime:ty) => {
-            if let DispatchDevice::$variant(inner) = device.as_dispatch() {
-                let client = <$runtime as Runtime>::client(inner);
-                supported = kernel::supported::<$runtime>(&client, n, num_kv_heads, head_dim);
-            }
-        };
+    #[cfg(feature = "cube-backend")]
+    if let burn::backend::DispatchDevice::Cube(cube) = device.as_dispatch() {
+        return kernel::supported(&cube.client(), n, num_kv_heads, head_dim);
     }
 
-    #[cfg(feature = "wgpu")]
-    probe!(Wgpu, cubecl::wgpu::WgpuRuntime<cubecl::wgpu::AutoCompiler>);
-    #[cfg(feature = "metal")]
-    probe!(Metal, cubecl::wgpu::WgpuRuntime<cubecl::wgpu::MslCompiler>);
-    #[cfg(feature = "vulkan")]
-    probe!(
-        Vulkan,
-        cubecl::wgpu::WgpuRuntime<cubecl::wgpu::SpirvCompiler>
-    );
-    #[cfg(feature = "webgpu")]
-    probe!(
-        WebGpu,
-        cubecl::wgpu::WgpuRuntime<cubecl::wgpu::WgslCompiler>
-    );
-    #[cfg(feature = "cuda")]
-    probe!(Cuda, cubecl::cuda::CudaRuntime);
-    #[cfg(feature = "rocm")]
-    probe!(Rocm, cubecl::hip::HipRuntime);
-
-    supported
+    false
 }
 
 /// Whether this device runs the kernel when nobody asked for either implementation.
@@ -166,36 +124,60 @@ pub(crate) fn device_supports(
 /// predicts a larger gain there, not a smaller one. A device that turns out to disagree can say so
 /// with `BURN_LM_PAGED_ATTENTION=reference`, and this function should grow a case for it.
 ///
-/// **wgpu, Vulkan, WebGPU, ROCm: not yet**, and the reason is different in kind. Those are not
-/// merely unmeasured hardware but unmeasured *compilation paths* — cubecl generates SPIR-V or
-/// HIP rather than MSL or PTX for them, so neither the Metal nor the CUDA numbers transfer. They
-/// stay opt-in until somebody runs the roofline bench on one.
+/// **wgpu, Vulkan, WebGPU, ROCm, cubecl's native Metal runtime: not yet**, and the reason is
+/// different in kind. Those are not merely unmeasured hardware but unmeasured *compilation paths* —
+/// cubecl generates WGSL, SPIR-V, HIP or its own Metal output rather than the MSL-through-wgpu and
+/// PTX the numbers above were taken on, so neither transfers. They stay opt-in until somebody runs
+/// the roofline bench on one.
+///
+/// # Asking the device which path it is
+///
+/// This used to be a match on `DispatchDevice::Metal` / `DispatchDevice::Cuda`. Those variants are
+/// gone with runtime erasure: every cubecl device is `DispatchDevice::Cube`, and what it names is
+/// inside. CUDA is still a variant of its own, so that half is unchanged in substance.
+///
+/// "Metal" is the awkward half, because burn's `metal` feature is not a runtime — it is wgpu with
+/// its MSL compiler, and the wgpu device only says which graphics API it is pinned to, which for
+/// `Device::wgpu` is `Auto`. So an unpinned device falls back to `cfg!(feature = "metal")`. That is
+/// not a new approximation: the old `DispatchDevice::Metal` variant was itself produced by a
+/// cargo-feature priority chain in burn's `From<WgpuDevice>` (metal, then vulkan, then webgpu), so
+/// the question was already being answered by the build's features and never by the device. A build
+/// that enables both `metal` and `vulkan` gets the Metal answer either way.
 pub(crate) fn device_defaults_to_kernel(device: &Device) -> bool {
-    #[allow(unused_imports)]
-    use burn::backend::DispatchDevice;
+    #[cfg(feature = "cube-backend")]
+    {
+        use burn::backend::{CubeDevice, DispatchDevice};
 
-    #[cfg(feature = "metal")]
-    if matches!(device.as_dispatch(), DispatchDevice::Metal(_)) {
-        return true;
+        let DispatchDevice::Cube(cube) = device.as_dispatch() else {
+            return false;
+        };
+
+        return match cube {
+            CubeDevice::Cuda(_) => true,
+            #[cfg(feature = "wgpu")]
+            CubeDevice::Wgpu(wgpu) => {
+                matches!(wgpu.backend, burn::backend::WgpuBackend::Metal) || cfg!(feature = "metal")
+            }
+            _ => false,
+        };
     }
 
-    #[cfg(feature = "cuda")]
-    if matches!(device.as_dispatch(), DispatchDevice::Cuda(_)) {
-        return true;
+    #[cfg(not(feature = "cube-backend"))]
+    {
+        let _ = device;
+        false
     }
-
-    let _ = device;
-    false
 }
 
 /// The fusion implementation — the one that actually runs.
 ///
-/// `burn::backend::Wgpu` is `Fusion<CubeBackend<WgpuRuntime>>`, so a burn-lm tensor never reaches
-/// the bare cubecl impl above. Modelled line for line on `burn-vision`'s cube ops.
+/// `burn::backend::Cube` — the type the generated dispatch arm names, and what `burn::backend::Wgpu`
+/// and `burn::backend::Cuda` are both aliases of now — is `Fusion<CubeBackend>`, so a burn-lm tensor
+/// never reaches the bare cubecl impl above. Modelled line for line on `burn-vision`'s cube ops.
 mod fusion {
     use super::*;
 
-    use burn::backend::Shape;
+    use burn::backend::{ExecutionError, Shape};
     use burn_fusion::{
         stream::{Operation, StreamId},
         Fusion, FusionBackend, FusionRuntime,
@@ -226,7 +208,7 @@ mod fusion {
                     handles: &mut HandleContainer<
                         <B1::FusionRuntime as FusionRuntime>::FusionHandle,
                     >,
-                ) {
+                ) -> Result<(), ExecutionError> {
                     let ([q, kp, vp, bt, ln], [out]) = self.desc.as_fixed::<5, 1>();
                     let result = B1::paged_decode(
                         handles.get_float_tensor::<B1>(q),
@@ -238,6 +220,13 @@ mod fusion {
                         self.scale,
                     );
                     handles.register_float_tensor::<B1>(&out.id, result);
+                    // Always `Ok`. `execute` grew a `Result` so that a failing operation claims only
+                    // its own writes instead of poisoning the whole stream (burn#5535), but nothing
+                    // below this line reports failure that way: every condition the kernel cannot
+                    // serve was already answered `None` on the host, and what is left — the
+                    // gate and the launch's preconditions having drifted apart — is a bug that
+                    // should abort loudly rather than be handed back as a recoverable error.
+                    Ok(())
                 }
             }
 

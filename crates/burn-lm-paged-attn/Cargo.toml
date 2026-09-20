@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 [features]
 default = []
 
-# The kernel itself, plus the two backend implementations it needs (`CubeBackend<R>` and
+# The kernel itself, plus the two backend implementations it needs (`CubeBackend` and
 # `Fusion<B>`). Without this feature the crate is only the host gate and the plain-Rust oracle, and
 # `paged_decode` always answers `None` — which is exactly the "backend without the kernel" path the
 # reference implementation exists to serve.
@@ -23,18 +23,28 @@ kernel = [
     "burn/ir",
 ]
 
-# One feature per backend the extension trait lists. Each has to turn on the matching `burn`
-# feature, because the dispatch arm the macro generates names that backend's `DispatchTensorKind`
-# variant, and the availability probe names its cubecl runtime — both of which only exist when
-# `burn` was built with the backend. A build that enables `burn/metal` but not this crate's `metal`
-# compiles fine and takes the reference path; the model-level gate in the test suite is what keeps
-# that from going unnoticed.
-wgpu = ["kernel", "burn/wgpu", "cubecl/wgpu"]
+# One feature per backend burn-lm can be built for. Each has to turn on the matching `burn`
+# feature, because the dispatch arm the macro generates and the device the availability probe
+# matches on only exist when `burn` was built with a cubecl backend. A build that enables
+# `burn/metal` but not this crate's `metal` compiles fine and takes the reference path; the
+# model-level gate in the test suite is what keeps that from going unnoticed.
+#
+# These no longer name distinct *backends* to the extension trait: since cubecl's runtime erasure
+# every runtime is the single `Cube` backend and the runtime is a property of the device value. They
+# still differ in which cubecl runtime gets linked, which is what decides whether a device of that
+# runtime can produce a client at all.
+wgpu = ["cube-backend", "burn/wgpu", "cubecl/wgpu"]
 metal = ["wgpu", "burn/metal", "cubecl/metal"]
 vulkan = ["wgpu", "burn/vulkan", "cubecl/vulkan"]
 webgpu = ["wgpu", "burn/webgpu", "cubecl/webgpu"]
-cuda = ["kernel", "burn/cuda", "cubecl/cuda"]
-rocm = ["kernel", "burn/rocm", "cubecl/rocm"]
+cuda = ["cube-backend", "burn/cuda", "cubecl/cuda"]
+rocm = ["cube-backend", "burn/rocm", "cubecl/rocm"]
+
+# "at least one of the backend features above is on" — what burn spells `cube_backend` and sets from
+# its own build script, which a downstream crate cannot read. The extension trait's backend list and
+# the `CubeDevice` the probe matches on both need exactly that condition and nothing finer, so it
+# gets a name here. Not meant to be enabled directly.
+cube-backend = ["kernel"]
 
 [dependencies]
 burn = { workspace = true, features = [
@@ -42,19 +52,9 @@ burn = { workspace = true, features = [
     "extension",
 ], default-features = false }
 
-burn-cubecl = { version = "=0.22.0-pre.3", default-features = false, features = [
-    "std",
-    "fusion",
-], optional = true }
-burn-fusion = { version = "=0.22.0-pre.3", default-features = false, features = [
-    "std",
-], optional = true }
-burn-ir = { version = "=0.22.0-pre.3", default-features = false, features = [
-    "std",
-], optional = true }
-cubecl = { version = "=0.11.0-pre.3", default-features = false, features = [
-    "std",
-    "stdlib",
-], optional = true }
+burn-cubecl = { workspace = true, features = ["std", "fusion"], optional = true }
+burn-fusion = { workspace = true, features = ["std"], optional = true }
+burn-ir = { workspace = true, features = ["std"], optional = true }
+cubecl = { workspace = true, features = ["std", "stdlib"], optional = true }
 derive-new = { version = "0.7", optional = true }
 tracing = { workspace = true }
