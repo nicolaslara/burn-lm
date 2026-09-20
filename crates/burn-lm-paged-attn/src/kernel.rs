@@ -66,7 +66,7 @@
 use burn::backend::cubecl::dtype_to_storage_type;
 use burn::backend::{Shape, TensorMetadata};
 use burn_cubecl::kernel::into_contiguous;
-use burn_cubecl::ops::numeric::empty_device_dtype;
+use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::tensor::CubeTensor;
 // One `Client` for every cubecl runtime, and a `CubeTensor` that does not name one either: since
 // runtime erasure the host side of this file is not generic over a runtime at all. Which runtime a
@@ -421,7 +421,13 @@ fn planes_per_cube(
 /// asks it so it can answer `None` and fall back, and [`launch`] asserts it, because reaching the
 /// launch with an unsupported configuration means the gate is wrong — a bug to fail loudly on, not
 /// a runtime condition to absorb.
-pub(crate) fn supported(client: &Client, n: usize, num_kv_heads: usize, head_dim: usize) -> bool {
+pub(crate) fn supported(
+    client: &Client,
+    n: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    elem_size: usize,
+) -> bool {
     let props = client.properties();
     let hw = &props.hardware;
 
@@ -445,15 +451,34 @@ pub(crate) fn supported(client: &Client, n: usize, num_kv_heads: usize, head_dim
     if num_kv_heads as u32 > hw.max_cube_count.0 || n as u32 > hw.max_cube_count.1 {
         return false;
     }
-    let _ = head_dim;
+
+    // Would this runtime store a row of `head_dim` elements packed? Every buffer the kernel reads
+    // is addressed by shape, one `head_dim`-sized row after another, so a runtime that pitches the
+    // innermost extent up to its memory alignment hands the kernel a pool it cannot address — and
+    // the pool is far too large to copy. CUDA and ROCm pitch; wgpu and the CPU runtime do not.
+    //
+    // The question is answered by *asking the allocator* rather than by restating its rule here,
+    // because restating it is how the two drift apart. The probe allocation is one row wide and
+    // its handle is dropped immediately, so it costs a pool reservation and no device work.
+    //
+    // It has to be answered HERE rather than at the launch, where the strides are actually in
+    // hand: under fusion the launch runs inside the registered operation, long after the caller
+    // committed to the kernel and threw away its fallback, so a decline down there is a panic.
+    // Everything this predicate refuses, the caller can still route to the reference.
+    let probe = client.empty_tensor(Shape::new([1, head_dim]), elem_size);
+    if probe.strides[0] != head_dim {
+        return false;
+    }
+
     true
 }
 
-/// Launch the kernel, or return `None` if this device or these pools cannot take it.
+/// Launch the kernel, or return `None` if this device cannot take it.
 ///
-/// The two `None` cases are different in kind and deliberately treated the same: an unsupported
-/// device is permanent, a non-contiguous pool is a shape the caller could in principle fix. Both
-/// mean "use the reference".
+/// `None` means "use the reference", and it is a device-permanent answer: [`supported`] is asked
+/// the same question the host gate already asked, so in practice this returns `Some`. Everything
+/// else here asserts, because under fusion the caller has no fallback left by the time the launch
+/// runs.
 pub(crate) fn launch(
     q: CubeTensor,
     k_pool: CubeTensor,
@@ -484,23 +509,25 @@ pub(crate) fn launch(
     assert_eq!(lengths.shape().dims::<1>()[0], n, "one length per lane");
 
     let client = q.client.clone();
-    if !supported(&client, n, num_kv_heads, head_dim) {
+    if !supported(&client, n, num_kv_heads, head_dim, q.dtype.size()) {
         return None;
     }
 
-    // The pools are read in place, addressed by shape. A strided pool view would need
-    // `into_contiguous`, and copying a multi-gigabyte pool would cost more than everything this
-    // kernel saves — so refuse instead. Today's pools are contiguous (`Tensor::empty` +
-    // `slice_assign` + in-place `scatter_nd`), but nothing in the type system says so, and a
-    // silent permanent disable here looks exactly like "the kernel didn't help".
-    if !k_pool.is_contiguous() || !v_pool.is_contiguous() {
-        tracing::warn!(
-            "burn-lm paged decode: the KV pools are not contiguous, falling back to the reference \
-             implementation for the rest of this process (copying the pool would cost more than \
-             the kernel saves)"
-        );
-        return None;
-    }
+    // The pools are read in place, addressed by shape, so a strided pool would be read at the
+    // wrong addresses; copying one is out of the question, since a multi-gigabyte `into_contiguous`
+    // per round would cost more than everything this kernel saves.
+    //
+    // This is an assertion and not a decline, because the caller has no fallback left by the time
+    // it fires: under fusion the launch runs from inside the registered operation, which must
+    // produce a tensor. The condition the caller *can* still act on — whether this runtime pitches
+    // a row of `head_dim` at all — is the probe in [`supported`], and it is asked early enough to
+    // answer `None`. Reaching here with a strided pool therefore means a pool arrived by some
+    // route other than the store's own allocation, and that is a bug to name rather than absorb.
+    assert!(
+        k_pool.is_contiguous() && v_pool.is_contiguous(),
+        "burn-lm paged decode: the KV pools are not contiguous, which the host gate is supposed \
+         to have made impossible (it declines any head_dim this runtime would pitch)"
+    );
 
     let plane_dim = client.properties().hardware.plane_size_max as usize;
     let width = vector_width(&client, q.dtype.size(), head_dim, plane_dim);
@@ -524,7 +551,19 @@ pub(crate) fn launch(
     let block_table = into_contiguous(block_table);
     let lengths = into_contiguous(lengths);
 
-    let out = empty_device_dtype(
+    // The output has to be *packed*, not merely freshly allocated. The kernel addresses `out` by
+    // shape — `(lane · num_heads + head) · slots + slot` — exactly as it addresses the pools, so a
+    // row of it must start every `head_dim` elements and nowhere else. The ordinary allocator does
+    // not promise that: CUDA and ROCm pitch the innermost dimension up to the memory alignment, so
+    // at head_dim 17 a row would occupy 32 elements and every write past the first row would land
+    // in the wrong place, leaving the gaps holding whatever the allocation came with. Ask for the
+    // contiguous layout instead, which is what the arithmetic already assumes.
+    //
+    // Today the gate hides this: the pitch is a function of the innermost extent alone, so any
+    // head_dim whose output would be pitched has pitched pools too, and [`supported`] has already
+    // declined it. That coincidence is not a guarantee, and it is not one worth resting silent
+    // corruption on.
+    let out = empty_device_contiguous_dtype(
         client.clone(),
         q.device.clone(),
         Shape::new([n, num_heads, 1, head_dim]),

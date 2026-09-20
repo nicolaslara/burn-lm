@@ -29,9 +29,11 @@ use crate::kernel;
 ///
 /// PRECONDITION: every check in `crate::paged_decode` passed. Reaching an implementation with an
 /// unsupported configuration is a bug in the host gate, not a runtime condition, so the impls
-/// assert rather than degrade — with one exception, the pool contiguity check inside
-/// `kernel::launch`, which the host cannot see through a `Tensor` and which therefore has to be
-/// allowed to decline.
+/// assert rather than degrade. There is no exception: `paged_decode` returns `FloatTensor`, and
+/// under fusion this runs from inside the registered operation, which has to produce one. The pool
+/// contiguity that `kernel::launch` needs but cannot see through a `Tensor` is answered up here
+/// instead, by asking the runtime whether it would pitch a row of `head_dim` at all — see
+/// `kernel::supported`.
 // One entry, not six. The macro's backend list names *selectors* — `Cube`, `Flex`, `NdArray`,
 // `LibTorch`, `Remote` — and since cubecl's runtime erasure `Cube` is every cubecl runtime at once:
 // CUDA, ROCm, Metal, Vulkan, wgpu, WebGPU and the CPU runtime. `Cuda` and `Wgpu` are no longer
@@ -94,10 +96,11 @@ pub(crate) fn device_supports(
     n: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    elem_size: usize,
 ) -> bool {
     #[cfg(feature = "cube-backend")]
     if let burn::backend::DispatchDevice::Cube(cube) = device.as_dispatch() {
-        return kernel::supported(&cube.client(), n, num_kv_heads, head_dim);
+        return kernel::supported(&cube.client(), n, num_kv_heads, head_dim, elem_size);
     }
 
     false

@@ -739,8 +739,9 @@ fn poisoned_dead_columns_cannot_reach_the_reference_output() {
 
     let out_ref = {
         let l = cache.layers_mut().next().unwrap();
-        host(paged_attention_reference(q, l, &plan, case.n_rep))
+        host(paged_attention_reference(q.clone(), l, &plan, case.n_rep))
     };
+    let q_saved = q;
     let non_finite = out_ref.iter().filter(|x| !x.is_finite()).count();
     assert_eq!(
         non_finite,
@@ -748,6 +749,50 @@ fn poisoned_dead_columns_cannot_reach_the_reference_output() {
         "{non_finite} of {} reference outputs are non-finite: the gathered scratch's dead columns \
          reached the value aggregation, where `0 · NaN` is NaN however well the score was masked",
         out_ref.len()
+    );
+
+    // The kernel's own finiteness, asserted separately rather than left to be inferred from a NaN
+    // in the comparison below. A NaN there says only that one of the two sides is non-finite, and
+    // that ambiguity has already cost one investigation: the answer was the kernel, and the cause
+    // had nothing to do with the poison (see `kernel::launch`, where the output is allocated).
+    let kernel_non_finite = out_kernel.iter().filter(|x| !x.is_finite()).count();
+    assert_eq!(
+        kernel_non_finite,
+        0,
+        "{kernel_non_finite} of {} kernel outputs are non-finite",
+        out_kernel.len()
+    );
+
+    // The host twin, over the pools' actual bytes. This is the side that says the ragged head_dim
+    // is walked *correctly*, not merely finitely: the tensor-op reference below shares none of the
+    // kernel's arithmetic order and on some backends is a good deal looser than the kernel is.
+    let out_twin = {
+        let (k_pool, v_pool) = layer(&mut cache).pools();
+        let (k_pool, v_pool) = (k_pool.assume_length_gated(), v_pool.assume_length_gated());
+        let k_host: Vec<f32> = k_pool.into_data().iter::<f32>().collect();
+        let v_host: Vec<f32> = v_pool.into_data().iter::<f32>().collect();
+        let q_host: Vec<f32> = q_saved.into_data().iter::<f32>().collect();
+        decode_reference_online(
+            &q_host,
+            &k_host,
+            &v_host,
+            &host_ints(plan.gather_idx.clone()),
+            &host_ints(plan.lengths.clone()),
+            DecodeShape {
+                n: case.n(),
+                num_kv_heads: case.num_kv_heads,
+                n_rep: case.n_rep,
+                head_dim: case.head_dim,
+                block_size: case.block_size,
+                blocks_per_lane: plan.blocks_per_lane,
+                scale: (1.0 / (case.head_dim as f64).sqrt()) as f32,
+            },
+        )
+    };
+    let (twin_lane, twin_diff) = worst_lane_diff(&out_kernel, &out_twin, case.n());
+    assert!(
+        twin_diff < 5.0e-6,
+        "kernel vs host twin under poison: lane {twin_lane} -> {twin_diff:e}"
     );
 
     // ...and it is still the right answer, not merely a finite one.
