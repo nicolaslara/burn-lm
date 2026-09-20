@@ -8,9 +8,9 @@
 //! rather than a deadlock.
 //!
 //! The f16 half of the kernel grid genuinely needs a second device: a device's float dtype is
-//! registry state keyed by dispatch variant and can only be set before that variant is first used,
-//! so f32 and f16 pools cannot share one. The fix is therefore not to avoid the second device but
-//! to bring *both* up inside a single `OnceLock`, before any test has started work on either —
+//! registry state keyed by the device's own id and can only be set before that device is first
+//! used, so f32 and f16 pools cannot share one. The fix is therefore not to avoid the second device
+//! but to bring *both* up inside a single `OnceLock`, before any test has started work on either —
 //! whoever asks first initializes the pair while everybody else waits on the lock, and by the time
 //! any test owns a device both channels are already live.
 //!
@@ -26,7 +26,7 @@ use burn::tensor::{Device, Tensor};
 struct TestDevices {
     /// The build's default device, at its default (f32) dtype. Everything but the f16 grid.
     default: Device,
-    /// A second dispatch variant, configured to f16 storage — see the module docs.
+    /// A second device, configured to f16 storage — see the module docs.
     #[cfg(all(feature = "metal", feature = "wgpu"))]
     f16: Device,
 }
@@ -45,14 +45,22 @@ fn devices() -> &'static TestDevices {
         #[cfg(all(feature = "metal", feature = "wgpu"))]
         let f16 = {
             use burn::tensor::{f16, DeviceConfig, Element};
-            // `Device::wgpu` rather than the default variant: the default is what every other test
+            // `Device::metal` rather than `Device::default()`: the default is what every other test
             // uses, and its dtype is therefore already locked in by the time anyone asks for f16.
-            let mut device = Device::wgpu(burn::tensor::DeviceKind::DefaultDevice);
+            //
+            // It used to be `Device::wgpu` here, which was a different *dispatch variant* from the
+            // `metal`-featured default. Runtime erasure collapsed those: `Device::default()` under
+            // burn's `metal` feature now builds the very same wgpu device this used to build, and
+            // configuring it a second time is an `AlreadyInitialized` error rather than a second
+            // device. What still separates two devices is the graphics API they are pinned to — the
+            // wgpu backend rides in the device id, so `Auto` and `Metal` are two ids, two clients
+            // and two registry entries for one GPU, which is exactly the pair this needs.
+            let mut device = Device::metal(burn::tensor::DeviceKind::DefaultDevice);
             device
                 .configure(DeviceConfig::default().float_dtype(f16::dtype()))
                 .expect(
                     "the f16 device must be configured before anything initializes it: something \
-                     in this test binary now uses Device::wgpu outside this module",
+                     in this test binary now uses Device::metal outside this module",
                 );
             warm(&device);
             device
