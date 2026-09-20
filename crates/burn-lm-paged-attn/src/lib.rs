@@ -64,8 +64,9 @@ pub use backend::PagedDecodeAttention;
 ///   because it holds one position per lane.
 /// - `k_pool`, `v_pool`: the layer's two pools, `[num_blocks, block_size, num_kv_heads, head_dim]`.
 ///   These must be contiguous and are never copied — an `into_contiguous` on a multi-gigabyte pool
-///   would cost more than everything this kernel saves, so a non-contiguous pool falls back
-///   instead.
+///   would cost more than everything this kernel saves. The gate below declines outright on any
+///   runtime that would pitch a row of `head_dim`, which is where a non-contiguous pool comes from
+///   (CUDA and ROCm pad the innermost extent up to the memory alignment).
 /// - `block_table`: `[n · blocks_per_lane]` block ids, each lane's covering blocks in position
 ///   order, short lanes padded with anything (the padding is never read). This is
 ///   `LanePlan::gather_idx` unchanged.
@@ -141,7 +142,7 @@ pub fn paged_decode(
             // every round is noise, and `BURN_LM_PAGED_ATTENTION=kernel` is the way in.
             return None;
         }
-        if !backend::device_supports(&device, n, num_kv_heads, head_dim) {
+        if !backend::device_supports(&device, n, num_kv_heads, head_dim, q.dtype().size()) {
             // Say so once. This is the gate that turns "the kernel was asked for" into "the kernel
             // never ran", and it is otherwise indistinguishable from "the kernel did not help".
             static DECLINED: std::sync::Once = std::sync::Once::new();

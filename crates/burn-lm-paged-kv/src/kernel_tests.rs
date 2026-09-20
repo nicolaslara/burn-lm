@@ -37,6 +37,24 @@ use crate::test_device::test_device as f32_device;
 #[cfg(all(feature = "metal", feature = "wgpu"))]
 use crate::test_device::f16_device;
 
+/// Slack applied to every kernel-vs-tensor-op-reference tolerance, and to nothing else.
+///
+/// The reference reaches its result through the backend's fused attention op, so its matmuls run
+/// on whatever the backend thinks "f32 matmul" means. On Ampere that is the tensor cores, which
+/// take f32 operands in as TF32 — a 10-bit mantissa — so a relative error near 1e-3 is structural
+/// there rather than a defect. The kernel accumulates in true f32 and does not pay it, which is
+/// why the disagreement appears against the reference and not against the host twin: measured over
+/// this grid on an A10G, the kernel tracks the twin to 1.5e-6 while the reference sits 7.4e-4
+/// away, and the twin is the exact one. Widening here loosens the comparison against the LESS
+/// accurate of the two implementations.
+///
+/// The twin bounds are therefore left exactly as tight as they are on every backend; they are the
+/// assertion with teeth. And 500x still leaves every bound here orders of magnitude below the O(1)
+/// error that a wrong rescale or a permuted head group produces, which is what these bounds exist
+/// to catch. The worst reference deviation actually observed on CUDA was 2.7e-3, against the
+/// loosest bound below (1e-4 x 500 = 5e-2).
+const REF_SLACK: f32 = if cfg!(feature = "cuda") { 500.0 } else { 1.0 };
+
 /// One case of the differential grid.
 #[derive(Debug, Clone)]
 struct Case {
@@ -313,7 +331,7 @@ fn check_per_lane(case: &Case, seed: u64, label: &str) {
         r.0, r.1, t.0, t.1
     );
     assert!(
-        r.1 < 1.0e-5,
+        r.1 < 1.0e-5 * REF_SLACK,
         "{label}: kernel vs tensor-op reference, lane {} -> {:e}",
         r.0,
         r.1
@@ -395,7 +413,7 @@ fn kernel_matches_the_reference_and_the_host_twin_in_f32() {
     for (i, case) in grid().into_iter().enumerate() {
         let (d_ref, d_twin) = compare(&case, &f32_device(), 0xC0FFEE + i as u64);
         assert!(
-            d_ref < 1.0e-5,
+            d_ref < 1.0e-5 * REF_SLACK,
             "kernel vs tensor-op reference: {d_ref:e} for {case:?}"
         );
         assert!(
@@ -447,7 +465,7 @@ fn kernel_handles_the_unpaged_block_size() {
         num_kv_heads: 2,
     };
     let (d_ref, d_twin) = compare(&case, &f32_device(), 7);
-    assert!(d_ref < 1.0e-5, "vs reference: {d_ref:e}");
+    assert!(d_ref < 1.0e-5 * REF_SLACK, "vs reference: {d_ref:e}");
     assert!(d_twin < 5.0e-6, "vs twin: {d_twin:e}");
 }
 
@@ -515,7 +533,7 @@ fn kernel_follows_a_non_monotonic_block_table() {
         host(paged_attention_reference(q.clone(), l, &plan, 4))
     };
     let d = max_norm_diff(&out_kernel, &out_ref);
-    assert!(d < 1.0e-5, "shuffled table: {d:e}");
+    assert!(d < 1.0e-5 * REF_SLACK, "shuffled table: {d:e}");
 }
 
 /// The test the tensor-op reference cannot pass.
@@ -739,8 +757,9 @@ fn poisoned_dead_columns_cannot_reach_the_reference_output() {
 
     let out_ref = {
         let l = cache.layers_mut().next().unwrap();
-        host(paged_attention_reference(q, l, &plan, case.n_rep))
+        host(paged_attention_reference(q.clone(), l, &plan, case.n_rep))
     };
+    let q_saved = q;
     let non_finite = out_ref.iter().filter(|x| !x.is_finite()).count();
     assert_eq!(
         non_finite,
@@ -750,10 +769,54 @@ fn poisoned_dead_columns_cannot_reach_the_reference_output() {
         out_ref.len()
     );
 
+    // The kernel's own finiteness, asserted separately rather than left to be inferred from a NaN
+    // in the comparison below. A NaN there says only that one of the two sides is non-finite, and
+    // that ambiguity has already cost one investigation: the answer was the kernel, and the cause
+    // had nothing to do with the poison (see `kernel::launch`, where the output is allocated).
+    let kernel_non_finite = out_kernel.iter().filter(|x| !x.is_finite()).count();
+    assert_eq!(
+        kernel_non_finite,
+        0,
+        "{kernel_non_finite} of {} kernel outputs are non-finite",
+        out_kernel.len()
+    );
+
+    // The host twin, over the pools' actual bytes. This is the side that says the ragged head_dim
+    // is walked *correctly*, not merely finitely: the tensor-op reference below shares none of the
+    // kernel's arithmetic order and on some backends is a good deal looser than the kernel is.
+    let out_twin = {
+        let (k_pool, v_pool) = layer(&mut cache).pools();
+        let (k_pool, v_pool) = (k_pool.assume_length_gated(), v_pool.assume_length_gated());
+        let k_host: Vec<f32> = k_pool.into_data().iter::<f32>().collect();
+        let v_host: Vec<f32> = v_pool.into_data().iter::<f32>().collect();
+        let q_host: Vec<f32> = q_saved.into_data().iter::<f32>().collect();
+        decode_reference_online(
+            &q_host,
+            &k_host,
+            &v_host,
+            &host_ints(plan.gather_idx.clone()),
+            &host_ints(plan.lengths.clone()),
+            DecodeShape {
+                n: case.n(),
+                num_kv_heads: case.num_kv_heads,
+                n_rep: case.n_rep,
+                head_dim: case.head_dim,
+                block_size: case.block_size,
+                blocks_per_lane: plan.blocks_per_lane,
+                scale: (1.0 / (case.head_dim as f64).sqrt()) as f32,
+            },
+        )
+    };
+    let (twin_lane, twin_diff) = worst_lane_diff(&out_kernel, &out_twin, case.n());
+    assert!(
+        twin_diff < 5.0e-6,
+        "kernel vs host twin under poison: lane {twin_lane} -> {twin_diff:e}"
+    );
+
     // ...and it is still the right answer, not merely a finite one.
     let (lane, diff) = worst_lane_diff(&out_ref, &out_kernel, case.n());
     assert!(
-        diff < 1.0e-5,
+        diff < 1.0e-5 * REF_SLACK,
         "reference vs kernel under poison: lane {lane} -> {diff:e}"
     );
 }
@@ -904,7 +967,7 @@ fn a_second_round_sees_the_first_rounds_writes() {
             host(paged_attention_reference(q.clone(), l, &plan, 4))
         };
         let d = max_norm_diff(&out_kernel, &out_ref);
-        assert!(d < 1.0e-5, "round {round}: {d:e}");
+        assert!(d < 1.0e-5 * REF_SLACK, "round {round}: {d:e}");
     }
 }
 
@@ -1138,7 +1201,7 @@ fn an_out_of_order_lane_subset_agrees_with_the_reference() {
         host(paged_attention_reference(q, l, &plan, n_rep))
     };
     let (lane, d) = worst_lane_diff(&out_kernel, &out_ref, n);
-    assert!(d < 1.0e-5, "lane subset {lanes:?}: row {lane} -> {d:e}");
+    assert!(d < 1.0e-5 * REF_SLACK, "lane subset {lanes:?}: row {lane} -> {d:e}");
 }
 
 /// The GQA head mapping, as a permutation test.
@@ -1214,7 +1277,7 @@ fn the_gqa_head_mapping_is_not_a_permutation() {
 
     // Scored per head slot, because a permutation is exactly what this is looking for.
     let (slot, worst) = worst_lane_diff(&out_kernel, &out_ref, n * num_heads);
-    assert!(worst < 1.0e-4, "head slot {slot}: {worst:e}");
+    assert!(worst < 1.0e-4 * REF_SLACK, "head slot {slot}: {worst:e}");
 
     let mut group_spread = 0.0f32;
     for lane in 0..n {
